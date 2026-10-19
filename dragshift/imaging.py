@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 from PIL.ExifTags import GPSTAGS, TAGS
 
-from .convert import atomic_save, fitz, flatten, open_image, open_pdf, save_image
+from .convert import atomic_save, fitz, open_image, open_pdf, save_image
 from .util import sibling
 
 EXT_TARGET = {".jpg": "JPG", ".jpeg": "JPG", ".png": "PNG", ".webp": "WEBP", ".tif": "TIFF",
@@ -53,18 +53,31 @@ def compress_image(src: str | Path, quality: int = 72, max_side: int | None = No
     return out
 
 
+PDF_SAVE = dict(garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True, use_objstms=1)
+
+
+def _shrink_pdf_images(doc, image_dpi: int, quality: int) -> None:
+    try:
+        doc.rewrite_images(dpi_threshold=image_dpi + 10, dpi_target=image_dpi,
+                           quality=quality, lossy=True, lossless=True, bitonal=True,
+                           color=True, gray=True, set_to_gray=False)
+    except Exception:
+        pass  # older PyMuPDF: still get structural compression when saving
+
+
 def compress_pdf(src: str | Path, image_dpi: int = 150, quality: int = 70) -> Path:
     out = sibling(src, "Compressed", ".pdf")
     with open_pdf(src) as doc:
-        try:
-            doc.rewrite_images(dpi_threshold=image_dpi + 10, dpi_target=image_dpi,
-                               quality=quality, lossy=True, lossless=True, bitonal=True,
-                               color=True, gray=True, set_to_gray=False)
-        except Exception:
-            pass  # older PyMuPDF: still get structural compression below
-        doc.save(out, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True,
-                 clean=True, use_objstms=1)
+        _shrink_pdf_images(doc, image_dpi, quality)
+        atomic_save(lambda dst: doc.save(str(dst), **PDF_SAVE), out)
     return out
+
+
+def compressed_pdf_bytes(src: str | Path, image_dpi: int, quality: int) -> bytes:
+    """What compress_pdf would write with these settings, in memory (to try several)."""
+    with open_pdf(src) as doc:
+        _shrink_pdf_images(doc, image_dpi, quality)
+        return doc.tobytes(**PDF_SAVE)
 
 
 def encode_size(im: Image.Image, target: str, quality: int) -> int:

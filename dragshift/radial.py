@@ -12,11 +12,11 @@ from typing import Callable
 
 from PySide6.QtCore import (QEasingCurve, QObject, QPoint, QPointF, QRectF, QRunnable, Qt,
                             QThreadPool, QTimer, QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QCursor, QFont, QGuiApplication, QImage, QPainter,
+from PySide6.QtGui import (QColor, QCursor, QGuiApplication, QImage, QPainter,
                            QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import QWidget
 
-from . import glass
+from . import design, glass
 
 
 @dataclass
@@ -31,9 +31,11 @@ class Item:
 SIZE = 400          # window size (room for shadow + hover pop)
 R_OUT = 158         # outer radius of petals
 R_IN = 60           # inner radius of petals
+HUB_DWELL_MS = 1500  # resting in the hub this long shows the next ring; long enough to read it
 R_HUB = 50          # hub radius
 GAP_DEG = 3.2
-CORNER = 10
+CORNER = design.RADIUS["petal"]
+SYMBOL_PT = 20      # SF Symbol size on tool petals (scaled by the painter on hover, never re-rendered)
 
 
 def sector_path(c: QPointF, r0: float, r1: float, a0: float, a1: float) -> QPainterPath:
@@ -48,10 +50,59 @@ def sector_path(c: QPointF, r0: float, r1: float, a0: float, a1: float) -> QPain
     return path
 
 
+_ROUNDED: dict[tuple, QPainterPath] = {}
+
+
+def rounded_sector_path(c: QPointF, r0: float, r1: float, a0: float, a1: float, rr: float) -> QPainterPath:
+    """`sector_path` with rounded corners, matching the liquid render's petals (cached)."""
+    key = (c.x(), c.y(), r0, r1, round(a0, 3), round(a1, 3), rr)
+    path = _ROUNDED.get(key)
+    if path is None:
+        from PySide6.QtGui import QPainterPathStroker
+        inset = math.degrees(rr / ((r0 + r1) / 2))      # side offset by ~rr at mid radius
+        core = sector_path(c, r0 + rr, r1 - rr, a0 + inset, a1 - inset)
+        st = QPainterPathStroker()
+        st.setWidth(2 * rr)
+        st.setJoinStyle(Qt.RoundJoin)
+        path = _ROUNDED[key] = core.united(st.createStroke(core)).simplified()
+    return path
+
+
 def angles(n: int, i: int) -> tuple[float, float]:
     span = 360.0 / n
     start = 90 + span / 2 - (i + 1) * span   # first petal centred at 12 o'clock, clockwise
     return start + GAP_DEG / 2, start + span - GAP_DEG / 2
+
+
+def polar(c: QPointF, r: float, deg: float) -> QPointF:
+    """The point `r` from `c` at angle `deg` (Qt convention, y grows downwards)."""
+    rad = math.radians(deg)
+    return QPointF(c.x() + r * math.cos(rad), c.y() - r * math.sin(rad))
+
+
+def step(index: int, count: int, delta: int) -> int:
+    """Keyboard: the petal `delta` places clockwise from `index`, wrapping round. With nothing
+    highlighted yet (index < 0), Right starts at the top petal and Left at the last one."""
+    if count <= 0:
+        return -1
+    if index < 0:
+        return 0 if delta > 0 else count - 1
+    return (index + delta) % count
+
+
+# keyboard control: Qt keys (menu has focus) map to the names the watcher polls during a drag
+NAV_QT_KEYS = {Qt.Key_Left: "left", Qt.Key_Right: "right", Qt.Key_Up: "up", Qt.Key_Down: "down",
+               Qt.Key_Return: "enter", Qt.Key_Enter: "enter", Qt.Key_Escape: "escape", Qt.Key_Tab: "tab"}
+POINTER_SLOP = 3    # px the pointer must move to take the highlight back from the keyboard
+RELEASE_HINT = "Release to finish"
+
+
+def modifier_name(key: int) -> str:
+    """Settings' key name for a modifier key press. Qt on macOS reports Command as Key_Control
+    and Control as Key_Meta."""
+    mac = sys.platform == "darwin"
+    return {Qt.Key_Shift: "shift", Qt.Key_Alt: "alt", Qt.Key_Control: "cmd" if mac else "ctrl",
+            Qt.Key_Meta: "ctrl" if mac else "cmd"}.get(key, "")
 
 
 # ---------------------------------------------------------------- background render
@@ -101,13 +152,21 @@ class RadialMenu(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.resize(SIZE, SIZE)
 
         self.paths: list[str] = []
         self.rings: dict[str, list[Item]] = {}
         self.ring_names: list[str] = []
         self.ring_idx = 0
+        self.wanted_ring = ""    # ring asked for by the key that opened the menu (shown once loaded)
+        self.ring_keys: dict[str, str] = {}   # ring name -> key glyph for the hub hint, e.g. "⌘"
+        self.wheel_keys: dict[str, str] = {}  # ring name -> Settings key name, e.g. "cmd"
         self.hover = -1          # petal index, -2 = hub, -1 = none
+        self.kbd = False         # the highlight came from the keyboard, not the pointer
+        self.last_pointer = QPointF(SIZE / 2, SIZE / 2)
+        self.committed: Item | None = None   # Enter ran this mid-drag; waiting for the drag to end
+        self._return_to = None   # macOS: app to hand focus back to when a keyboard menu is dismissed
         self.cursor_pos = QPointF(SIZE / 2, SIZE / 2)
         self.hub_text = ""
         self.backdrop: QPixmap | None = None     # blurred, for the instant fallback
@@ -123,18 +182,42 @@ class RadialMenu(QWidget):
         self.spring: list[float] = []   # per-petal hover amount 0..1 (eased every frame)
         self.hub_spring = 0.0
 
-        self.anim = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=190,
-                                      easingCurve=QEasingCurve.OutBack)
+        self.anim = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=300,
+                                      easingCurve=design.spring_curve(damping=0.72, response=0.42))
         self.anim.valueChanged.connect(self._set_t)
-        self.swap_anim = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=220,
+        self.swap_anim = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=design.DURATION["standard"],
                                            easingCurve=QEasingCurve.OutCubic)
         self.swap_anim.valueChanged.connect(self._set_swap)
-        self.hub_timer = QTimer(self, singleShot=True, interval=420, timeout=self.next_ring)
+        self.hub_timer = QTimer(self, singleShot=True, interval=HUB_DWELL_MS, timeout=self.next_ring)
         self.frame = QTimer(self, interval=16, timeout=self._tick)   # 60 fps springs
+        # load SF Symbols and fonts while idle after start-up, so the first menu opens instantly
+        QTimer.singleShot(0, self._warm)
+
+    def _warm(self):
+        """Render every petal symbol and label font once (the caches keep them)."""
+        from PySide6.QtGui import QPixmap as _Pixmap
+        colors = [design.color("label", dark=True), design.color("label", dark=False), design.color("onAccent")]
+        for c in colors:
+            c.setAlpha(255)
+            for label, sym in design.SYMBOLS.items():
+                design.symbol(sym, SYMBOL_PT, c, fallback="•")
+        pm = _Pixmap(8, 8)
+        p = QPainter(pm)
+        for role in ("hubTop", "hubSub", "tool", "format"):
+            p.setFont(_font(role))
+            p.drawText(0, 8, "PNG Aa")
+        p.end()
 
     # ------------------------------------------------------------ show / hide
-    def popup(self, pos: QPoint | None = None, paths: list[str] | None = None):
+    def popup(self, pos: QPoint | None = None, paths: list[str] | None = None, ring: str = "",
+              dragged: list[str] | None = None):
+        """Open under `pos`. `ring` picks the starting ring (the wheel whose key was pressed);
+        when the files don't have that ring, the first ring they do have is shown.
+        `paths` opens a click menu (tray, Services); `dragged` are files already known to be on
+        the drag (macOS drag pasteboard), so the rings and keyboard work before the drag reaches
+        the window."""
         pos = pos or QCursor.pos()
+        self.wanted_ring = ring
         tl = pos - QPoint(SIZE // 2, SIZE // 2)
         scr = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
         g = scr.geometry()
@@ -184,23 +267,34 @@ class RadialMenu(QWidget):
             self._raw_backdrop = None
         self.move(tl)
         self.hover = -1
+        self.kbd = False
+        self.committed = None
+        self.last_pointer = QPointF(pos - tl)
         self.got_drag = False
         self.hub_armed = False  # drags start on the hub; don't flip until they leave it
         self.click_mode = paths is not None
+        self._set_focusable(self.click_mode)
         if paths is not None:
             self._load(paths)
+        elif dragged:
+            self.got_drag = True
+            self._load(dragged)
         else:
             self.paths, self.rings, self.ring_names = [], {}, []
             self.hub_text = "Drop here"
             for n in (4, 7):  # most common rings: render speculatively
                 self._render(n)
         self._t = 0.0
+        self._still = design.reduce_motion()   # Reduce motion: fade in, no scale/spring
+        self.anim.setDuration(design.DURATION["fast"] if self._still else 300)
         self._shape()
         self.show()
         self.raise_()
+        self._announce()
         self.anim.start()
         self.frame.start()
         if self.click_mode:
+            self._take_focus()
             # behave like a popup: a click anywhere outside dismisses it
             QTimer.singleShot(0, self.grabMouse)
 
@@ -210,6 +304,30 @@ class RadialMenu(QWidget):
             self.frame.stop()
             self.hub_timer.stop()
             self.dismissed.emit()
+            if self.click_mode:
+                self._give_back_focus()
+
+    def _set_focusable(self, on: bool):
+        """Drag menus never take focus (the drag owns input; keys come from the watcher). Click
+        menus (tray, Services shortcut) take it, so the arrow keys reach keyPressEvent."""
+        if bool(self.windowFlags() & Qt.WindowDoesNotAcceptFocus) == on:
+            self.setWindowFlag(Qt.WindowDoesNotAcceptFocus, not on)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, not on)
+
+    def _take_focus(self):
+        if sys.platform == "darwin":
+            from . import platform_mac
+            self._return_to = platform_mac.frontmost_app()
+            platform_mac.activate()   # a menu-bar app isn't active: its window can't get keys otherwise
+        self.activateWindow()
+        self.setFocus(Qt.PopupFocusReason)
+
+    def _give_back_focus(self):
+        """Dismissed with Escape or a click outside: Finder (or whoever had it) gets focus back."""
+        app, self._return_to = self._return_to, None
+        if app is not None and sys.platform == "darwin":
+            from . import platform_mac
+            platform_mac.reactivate(app)
 
     def hideEvent(self, e):
         self.frame.stop()
@@ -236,13 +354,31 @@ class RadialMenu(QWidget):
         self.paths = paths
         self.rings = {k: v for k, v in self.build_rings(paths).items() if v}
         self.ring_names = list(self.rings)
-        self.ring_idx = 0
+        self.ring_idx = self.ring_names.index(self.wanted_ring) if self.wanted_ring in self.ring_names else 0
         self.hub_text = self.describe(paths)
         for items in self.rings.values():
             self._render(len(items))
         self.spring = [0.0] * len(self.items)
         self._shape()
+        self._announce()
         self.update()
+
+    def _announce(self):
+        """VoiceOver: name the menu, the current ring and the highlighted item (pointer or keys)."""
+        items = self.items
+        ring = self.ring_names[self.ring_idx] if self.ring_names else ""
+        if self.committed is not None or 0 <= self.hover < len(items):
+            name = ", ".join(t for t in self.hub_lines() if t)
+        else:
+            name = f"DragShift {ring} menu" if ring else "DragShift menu"
+        self.setAccessibleName(name)
+        self.setAccessibleDescription(", ".join(i.label for i in items))
+        try:
+            from PySide6.QtGui import QAccessible, QAccessibleEvent
+            if QAccessible.isActive():
+                QAccessible.updateAccessibility(QAccessibleEvent(self, QAccessible.NameChanged))
+        except Exception:
+            pass
 
     def _shape(self):
         """No compositor (XFCE etc.): cut the window to the menu's outline."""
@@ -264,13 +400,102 @@ class RadialMenu(QWidget):
 
     def next_ring(self):
         if len(self.ring_names) > 1:
-            self.ring_idx = (self.ring_idx + 1) % len(self.ring_names)
-            self.hover = -1
-            self.spring = [0.0] * len(self.items)
-            self._swap = 0.0
-            self.swap_anim.start()
-            self._shape()
+            self._go_to((self.ring_idx + 1) % len(self.ring_names))
+
+    def show_ring(self, name: str):
+        """Switch straight to the named ring. Before the files arrive, remember it instead."""
+        if not self.ring_names:
+            self.wanted_ring = name
+        elif name in self.ring_names and self.ring_names.index(name) != self.ring_idx:
+            self._go_to(self.ring_names.index(name))
+
+    def ring_key(self, name: str):
+        """A wheel's key was pressed while open: show that wheel, or the next ring when it's
+        already showing (tapping the same key again cycles, as with one key before)."""
+        if self.ring_names and self.ring_names[self.ring_idx] == name:
+            self.next_ring()
+        else:
+            self.show_ring(name)
+
+    # ------------------------------------------------------------ keyboard
+    def nav(self, key: str):
+        """Keyboard control, from keyPressEvent (click menus have focus) or the watcher (during a
+        drag the menu never gets focus). Left/Right move round the wheel, Up/Down and Tab switch
+        wheels keeping the position, Enter picks, Escape closes."""
+        if key == "escape":
+            self.close_menu()
+        elif self.committed is not None:
+            return    # Enter already ran an item: only waiting for the drag to end
+        elif key in ("left", "right"):
+            self._key_select(step(self.hover, len(self.items), 1 if key == "right" else -1))
+        elif key in ("up", "down", "tab"):
+            self._key_ring(-1 if key == "up" else 1)
+        elif key == "enter":
+            self._enter()
+
+    def _key_select(self, idx: int):
+        """Highlight a petal from the keyboard: the same accent petal as a hover, with the light
+        gathered at the petal's centre instead of under the pointer."""
+        if idx < 0:
+            return
+        self.kbd = True
+        n = len(self.items)
+        a0, a1 = angles(n, idx)
+        self._set_hover(idx, polar(QPointF(SIZE / 2, SIZE / 2), (R_IN + R_OUT) / 2, (a0 + a1) / 2))
+
+    def _key_ring(self, delta: int):
+        if len(self.ring_names) < 2:
+            return
+        keep = self.hover
+        self._go_to((self.ring_idx + delta) % len(self.ring_names))
+        if keep >= 0:
+            self._key_select(min(keep, len(self.items) - 1))
+
+    def _enter(self):
+        if self.hover == -2:
+            self.next_ring()      # same as clicking the hub
+        elif not 0 <= self.hover < len(self.items):
+            return
+        elif self.click_mode:
+            self._activate(self.hover)
+        else:
+            # mid-drag: the files are known (drag pasteboard or the drag entering us), so run now.
+            # The menu stays up as a harmless place to let go, so the drop can't land on a folder
+            # underneath and move the file; the release (or Escape) closes it.
+            item, paths = self.items[self.hover], list(self.paths)
+            self.committed = item
+            self.hub_timer.stop()
+            self._announce()
             self.update()
+            QTimer.singleShot(0, lambda: self.activated.emit(item, paths))
+
+    def _activate(self, idx: int) -> bool:
+        """Run petal `idx` (drop, click or Enter) after closing; False when it isn't a petal."""
+        items = self.items
+        if not 0 <= idx < len(items):
+            return False
+        item, paths = items[idx], list(self.paths)
+        self.hide()
+        # return to the drag loop / event loop immediately; do the work after
+        QTimer.singleShot(0, lambda: self.activated.emit(item, paths))
+        return True
+
+    def _wheel_for(self, key_name: str) -> str:
+        return next((wheel for wheel, key in self.wheel_keys.items() if key == key_name), "") if key_name else ""
+
+    def _go_to(self, idx: int):
+        """Animated switch to ring `idx` (the same swap for keys, hub dwell and clicks)."""
+        self.ring_idx = idx
+        if self.hover == -2:
+            self.hub_timer.start()  # still resting in the hub: next flip only after another full dwell
+        else:
+            self.hover = -1
+        self.spring = [0.0] * len(self.items)
+        self._swap = 0.0
+        self.swap_anim.start()
+        self._shape()
+        self._announce()
+        self.update()
 
     def _set_t(self, v):
         self._t = float(v)
@@ -331,6 +556,7 @@ class RadialMenu(QWidget):
             self.hover = h
             if h >= 0:
                 self.hub_armed = True  # visited a petal: hovering the hub may now flip rings
+            self._announce()
             if h == -2 and self.hub_armed and len(self.ring_names) > 1:
                 self.hub_timer.start()
             else:
@@ -356,31 +582,54 @@ class RadialMenu(QWidget):
         e.accept()
 
     def dragMoveEvent(self, e):
-        self._set_hover(self.hit(e.position()), e.position())
+        self._pointer(e.position())
         e.setDropAction(Qt.CopyAction)
         e.accept()
 
     def dragLeaveEvent(self, e):
-        self._set_hover(-1)
+        self._pointer_left()
 
     def dropEvent(self, e):
-        idx = self.hit(e.position())
-        items = self.items
-        if 0 <= idx < len(items):
+        if self.committed is not None:
+            # Enter already ran the item: swallow the drop (as a copy, so nothing moves)
             e.setDropAction(Qt.CopyAction)
             e.accept()
-            item, paths = items[idx], list(self.paths)
             self.hide()
-            # return to Explorer's drag loop immediately; do the work after
-            QTimer.singleShot(0, lambda: self.activated.emit(item, paths))
+            return
+        idx = self.target(e.position())
+        if 0 <= idx < len(self.items):
+            e.setDropAction(Qt.CopyAction)
+            e.accept()
+            self._activate(idx)
         else:
             e.ignore()
             self.close_menu()
 
+    def _moved(self, pos: QPointF) -> bool:
+        return (pos - self.last_pointer).manhattanLength() >= POINTER_SLOP
+
+    def target(self, pos: QPointF) -> int:
+        """The petal a drop at `pos` runs: the keyboard's pick while the pointer stays put (so
+        arrowing to a petal and letting go works like Enter), otherwise the one under it."""
+        return self.hover if self.kbd and not self._moved(pos) else self.hit(pos)
+
+    def _pointer(self, pos: QPointF):
+        """The pointer (or a drag) is over the menu. It takes the highlight back from the
+        keyboard only once it really moves: macOS repeats drag-move events while it's still."""
+        if self.committed is not None or (self.kbd and not self._moved(pos)):
+            return
+        self.kbd = False
+        self.last_pointer = QPointF(pos)
+        self._set_hover(self.hit(pos), pos)
+
+    def _pointer_left(self):
+        if self.committed is None and not self.kbd:
+            self._set_hover(-1)
+
     # ------------------------------------------------------------ click mode
     def mouseMoveEvent(self, e):
         if self.click_mode:
-            self._set_hover(self.hit(e.position()), e.position())
+            self._pointer(e.position())
 
     def mouseReleaseEvent(self, e):
         if not self.click_mode:
@@ -391,28 +640,39 @@ class RadialMenu(QWidget):
         idx = self.hit(e.position())
         if idx == -2:
             self.next_ring()
-        elif 0 <= idx < len(self.items):
-            item, paths = self.items[idx], list(self.paths)
-            self.hide()
-            QTimer.singleShot(0, lambda: self.activated.emit(item, paths))
-        else:
+        elif not self._activate(idx):
             self.close_menu()
 
     def keyPressEvent(self, e):
-        if e.key() == Qt.Key_Escape:
-            self.close_menu()
-        elif e.key() in (Qt.Key_Tab, Qt.Key_Shift):
+        """Click menus have focus: the same keys as the watcher polls during a drag, plus a
+        wheel's key (Shift, Command, Control...) jumps to that wheel."""
+        key = NAV_QT_KEYS.get(e.key())
+        wheel = self._wheel_for(modifier_name(e.key()))
+        if key:
+            self.nav(key)
+        elif wheel:
+            self.ring_key(wheel)
+        elif e.key() == Qt.Key_Shift:
             self.next_ring()
+        else:
+            super().keyPressEvent(e)
+
+    def focusNextPrevChild(self, forward: bool) -> bool:
+        return False   # Tab switches wheels; don't let Qt use it to move focus
 
     def leaveEvent(self, e):
         if self.click_mode:
-            self._set_hover(-1)
+            self._pointer_left()
 
     # ------------------------------------------------------------ painting
     def _text_colors(self) -> tuple[QColor, QColor, QColor]:
-        if self.is_light:
-            return QColor(28, 20, 44), QColor(28, 20, 44, 170), QColor(255, 255, 255, 120)
-        return QColor(255, 255, 255), QColor(255, 255, 255, 190), QColor(0, 0, 0, 110)
+        """Label, secondary label and a soft text shadow, for the glass's own brightness
+        (Liquid Glass adapts to what's behind it, not to the system appearance)."""
+        dark = not self.is_light
+        shadow = QColor(255, 255, 255, 90) if self.is_light else QColor(0, 0, 0, 90)
+        fg = design.color("label", dark=dark)
+        fg.setAlpha(255)   # full-strength labels on glass: the backdrop varies too much for 85%
+        return fg, design.color("secondaryLabel", dark=dark, alpha=1.25), shadow
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -421,11 +681,14 @@ class RadialMenu(QWidget):
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         c = QPointF(SIZE / 2, SIZE / 2)
         t = self._t
-        p.setOpacity(min(1.0, max(0.0, t * 1.5)))
-        p.translate(c)
-        s = 0.80 + 0.20 * t
-        p.scale(s, s)
-        p.translate(-c)
+        if getattr(self, "_still", False):
+            p.setOpacity(min(1.0, max(0.0, t)))
+        else:
+            p.setOpacity(min(1.0, max(0.0, t * 1.8)))
+            p.translate(c)
+            s = 0.86 + 0.14 * t
+            p.scale(s, s)
+            p.translate(-c)
 
         items = self.items
         n = len(items)
@@ -450,23 +713,26 @@ class RadialMenu(QWidget):
         self._paint_hub(p, c, fg, fg_dim, shadow_col)
 
     def _paint_fallback(self, p: QPainter, c: QPointF, n: int):
+        tint = design.color("glassTintSolid" if design.reduce_transparency() else "glassTint", dark=True)
+        tint.setAlpha(min(tint.alpha(), 120) if not design.reduce_transparency() else 240)
         hub = QPainterPath()
         hub.addEllipse(c, R_HUB, R_HUB)
-        glass.paint_glass(p, hub, self.backdrop, QPointF(0, 0), tint=QColor(22, 18, 34, 80),
-                          rainbow_alpha=150, highlight=1.3)
+        glass.paint_glass(p, hub, self.backdrop, QPointF(0, 0), tint=tint, rainbow_alpha=0, highlight=1.2)
         for i in range(n):
             a0, a1 = angles(n, i)
             glass.paint_glass(p, sector_path(c, R_IN, R_OUT, a0, a1), self.backdrop, QPointF(0, 0),
-                              tint=QColor(22, 18, 34, 62), rainbow_alpha=140)
+                              tint=tint, rainbow_alpha=0)
 
     def _paint_hover(self, p: QPainter, c: QPointF, a0: float, a1: float, h: float, img: QImage | None):
+        """Selected petal: the accent colour, like a selected menu item, with light gathering
+        under the pointer and a brighter rim; it lifts towards the pointer."""
         mid = math.radians((a0 + a1) / 2)
-        r_mid = (R_IN + R_OUT) / 2
-        pc = QPointF(c.x() + r_mid * math.cos(mid), c.y() - r_mid * math.sin(mid))
-        k = 1 + 0.07 * h                     # elastic "pop" towards the cursor
-        push = 6 * h
+        pc = polar(c, (R_IN + R_OUT) / 2, (a0 + a1) / 2)
+        lift = 0.0 if getattr(self, "_still", False) else h
+        k = 1 + 0.06 * lift
+        push = 6 * lift
         off = QPointF(push * math.cos(mid), -push * math.sin(mid))
-        path = sector_path(c, R_IN - 1, R_OUT + 1, a0, a1)
+        path = rounded_sector_path(c, R_IN, R_OUT, a0, a1, CORNER)
         p.save()
         p.translate(pc + off)
         p.scale(k, k)
@@ -476,55 +742,44 @@ class RadialMenu(QWidget):
             p.setClipPath(path)
             p.drawImage(0, 0, img)
             p.restore()
-        # light blooming up from underneath the cursor
-        glow_c = self.cursor_pos - off
-        g = QRadialGradient(glow_c, 120)
-        g.setColorAt(0.0, QColor(255, 196, 120, int(150 * h)))
-        g.setColorAt(0.45, QColor(255, 90, 150, int(95 * h)))
-        g.setColorAt(1.0, QColor(130, 100, 255, int(40 * h)))
-        p.fillPath(path, g)
-        # brighter specular rim + iridescent edge while hovered
-        p.setPen(QPen(QColor(255, 255, 255, int(170 * h)), 1.3))
-        p.drawPath(path)
-        p.setPen(glass.iridescent_pen(c, 2.2, int(230 * h), angle=(a0 + a1) / 2))
+        p.fillPath(path, design.color("accent", alpha=0.82 * h))
+        glow = QRadialGradient(self.cursor_pos - off, 110)
+        glow.setColorAt(0.0, QColor(255, 255, 255, int(70 * h)))
+        glow.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillPath(path, glow)
+        p.setPen(QPen(QColor(255, 255, 255, int(150 * h)), 1.2))
         p.drawPath(path)
         p.restore()
+
+    def hub_lines(self) -> tuple[str, str]:
+        """Hub text: the hovered item and its hint, or the files and the next ring with its
+        key (e.g. "⌘ Tools"). After Enter mid-drag: the item and a nudge to let go."""
+        if self.committed is not None:
+            return self.committed.label, RELEASE_HINT
+        items = self.items
+        if 0 <= self.hover < len(items):
+            return items[self.hover].label, items[self.hover].hint or ""
+        if len(self.ring_names) > 1:
+            other = self.ring_names[(self.ring_idx + 1) % len(self.ring_names)]
+            return self.hub_text, f"{self.ring_keys.get(other, '')} {other}".strip()
+        return self.hub_text, self.ring_names[self.ring_idx] if self.ring_names else ""
 
     def _paint_hub(self, p: QPainter, c: QPointF, fg: QColor, fg_dim: QColor, shadow_col: QColor):
         hs = self.hub_spring
         if hs > 0.001:
             g = QRadialGradient(c, R_HUB)
-            g.setColorAt(0, QColor(255, 255, 255, int(70 * hs)))
-            g.setColorAt(1, QColor(255, 255, 255, int(20 * hs)))
+            g.setColorAt(0, QColor(255, 255, 255, int(60 * hs)))
+            g.setColorAt(1, QColor(255, 255, 255, int(18 * hs)))
             p.setPen(Qt.NoPen)
             p.setBrush(g)
             p.drawEllipse(c, R_HUB, R_HUB)
-        p.setPen(glass.iridescent_pen(c, 1.2, 150, angle=60))
-        p.setBrush(Qt.NoBrush)
-        p.drawEllipse(c, R_HUB - 0.5, R_HUB - 0.5)
 
-        items = self.items
-        hov = items[self.hover] if 0 <= self.hover < len(items) else None
-        if hov is not None:
-            top, sub = hov.label if not hov.glyph else hov.label.title(), hov.hint or ""
-        else:
-            ring_name = self.ring_names[self.ring_idx] if self.ring_names else ""
-            top = self.hub_text
-            if len(self.ring_names) > 1:
-                other = self.ring_names[(self.ring_idx + 1) % len(self.ring_names)]
-                sub = f"⇧ {other.upper()}"
-            else:
-                sub = ring_name.upper()
-        f = QFont("Segoe UI Variable Display", 1)
-        f.setPixelSize(14)
-        f.setBold(True)
-        p.setFont(f)
-        rect_top = QRectF(c.x() - R_HUB + 4, c.y() - 21, 2 * R_HUB - 8, 20)
-        self._text(p, rect_top, top, fg, shadow_col)
-        f.setPixelSize(10)
-        f.setBold(False)
-        p.setFont(f)
-        self._text(p, QRectF(c.x() - R_HUB + 6, c.y() + 2, 2 * R_HUB - 12, 28), sub, fg_dim, None,
+        top, sub = self.hub_lines()
+        p.setFont(_font("hubTop"))
+        rect_top = QRectF(c.x() - R_HUB + 4, c.y() - 20, 2 * R_HUB - 8, 18)
+        self._text(p, rect_top, p.fontMetrics().elidedText(top, Qt.ElideRight, int(rect_top.width())), fg, shadow_col)
+        p.setFont(_font("hubSub"))
+        self._text(p, QRectF(c.x() - R_HUB + 6, c.y() + 1, 2 * R_HUB - 12, 28), sub, fg_dim, None,
                    Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap)
 
     @staticmethod
@@ -532,33 +787,49 @@ class RadialMenu(QWidget):
               flags=Qt.AlignCenter):
         if shadow is not None:
             p.setPen(shadow)
-            p.drawText(r.translated(0, 1), flags, text)
+            p.drawText(r.translated(0, 0.5), flags, text)
         p.setPen(col)
         p.drawText(r, flags, text)
 
     def _petal_label(self, p: QPainter, c: QPointF, it: Item, ang: float, r: float,
                      h: float, fg: QColor, shadow_col: QColor):
-        rad = math.radians(ang)
-        push = 6 * h
-        pt = QPointF(c.x() + (r + push) * math.cos(rad), c.y() - (r + push) * math.sin(rad))
+        push = 0.0 if getattr(self, "_still", False) else 6 * h
+        pt = polar(c, r + push, ang)
         p.save()
         p.setOpacity(p.opacity() * (0.25 + 0.75 * self._swap))
-        col = QColor(255, 255, 255) if h > 0.5 else fg   # hovered petal is warm-lit: white text
-        f = QFont("Segoe UI Variable Display", 1)
+        selected = h > 0.5
+        col = design.color("onAccent") if selected else fg     # text on the accent fill
+        shadow = None if selected else shadow_col
+        sym = design.SYMBOLS.get(it.label, "") if it.glyph else ""
         if it.glyph:
-            f.setPixelSize(int(18 + 3 * h))
-            p.setFont(f)
-            self._text(p, QRectF(pt.x() - 30, pt.y() - 24, 60, 24), it.glyph, col, shadow_col,
-                       Qt.AlignHCenter | Qt.AlignBottom)
-            f.setPixelSize(10)
-            f.setBold(True)
-            f.setLetterSpacing(QFont.AbsoluteSpacing, 0.7)
-            p.setFont(f)
-            self._text(p, QRectF(pt.x() - 42, pt.y() + 1, 84, 16), it.label.upper(), col, shadow_col)
+            # tool petal: SF Symbol above a small label (Pages' toolbar items)
+            pm = design.symbol(sym, SYMBOL_PT, col, fallback=it.glyph)
+            if pm is not None:
+                sz = pm.deviceIndependentSize()
+                k = 1 + 0.12 * h
+                p.save()
+                p.translate(pt.x(), pt.y() - 11)
+                p.scale(k, k)
+                p.drawPixmap(QPointF(-sz.width() / 2, -sz.height() / 2), pm)
+                p.restore()
+            p.setFont(_font("tool"))
+            self._text(p, QRectF(pt.x() - 44, pt.y() + 4, 88, 16), it.label, col, shadow)
         else:
-            f.setPixelSize(int(14 + 2 * h))
-            f.setBold(True)
-            f.setLetterSpacing(QFont.AbsoluteSpacing, 0.9)
-            p.setFont(f)
-            self._text(p, QRectF(pt.x() - 42, pt.y() - 12, 84, 24), it.label, col, shadow_col)
+            p.setFont(_font("format"))
+            k = 1 + 0.1 * h
+            p.translate(pt)
+            p.scale(k, k)
+            self._text(p, QRectF(-44, -12, 88, 24), it.label, col, shadow)
         p.restore()
+
+
+_FONTS: dict[str, object] = {}
+
+
+def _font(role: str):
+    """Fonts used every frame, built once on first paint (needs a running app)."""
+    f = _FONTS.get(role)
+    if f is None:
+        f = _FONTS[role] = design.font(*{"hubTop": ("headline",), "hubSub": ("caption1", 500),
+                                         "tool": ("subheadline", 600), "format": ("title3", 600)}[role])
+    return f

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -14,12 +15,14 @@ from PySide6.QtGui import (QAction, QColor, QCursor, QDesktopServices, QGuiAppli
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
-from . import __version__, convert, glass, imaging, report, tools
+from . import __version__, actions, archives, compress, convert, glass, imaging, media, media_windows, qr, report, tools
+from .reorder import ReorderWindow
+from .floating import Floats
 from .radial import Item, RadialMenu
-from .settings import Settings, SettingsWindow, WelcomeWindow, TRIGGERS
-from .toasts import ToastStack
+from .settings import Settings, SettingsWindow, WelcomeWindow, key_glyphs
+from .toasts import ToastStack, trash, trash_message
 from .trigger import DragShiftWatcher
-from .util import UserError, category, file_size, human_size, keep, release
+from .util import UserError, category, file_size, human_size, keep, plural, release
 
 APP_NAME = "DragShift"
 TIP_URL = "https://cash.app/$AtikaKadesha"
@@ -31,28 +34,72 @@ IPC_NAME = ipc_name()
 
 GLYPHS = {"Compress": "⇲", "Metadata": "ⓘ", "Redact": "▮", "Crop": "⌗", "Edit": "☼",
           "Annotate": "✎", "Add BG": "▣", "Resize": "⤢", "Split": "✂", "Rotate": "⟳",
-          "Merge": "⧉", "Protect": "⚿", "Extract": "⧈"}
+          "Merge": "⧉", "Protect": "⚿", "Extract": "⧈", "Audio": "♪", "Mute": "⊘", "Frame": "◧",
+          "Normalize": "≈", "Strip Tags": "⌫", "Trim": "⇹", "Speed": "»",
+          "Read QR": "▦", "Reorder": "⇅", "Extract Files": "⇱",
+          "AirDrop": "◉", "Float": "⌖", "Copy": "⧉", "Move": "➜", "Copy Path": "⎘", "Terminal": "›_",
+          "Zip": "▤"}
 
 HINTS = {
     "Compress": "Shrink file size", "Metadata": "View · remove GPS", "Redact": "Hide private info",
     "Crop": "Trim to a ratio", "Edit": "Light · colour · rotate", "Annotate": "Arrows · text · steps",
     "Add BG": "Gradient backdrop", "Resize": "Change dimensions", "Split": "One PDF per page",
     "Rotate": "Turn pages 90°", "Merge": "Join into one PDF", "Protect": "Add a password",
-    "Extract": "Save embedded images",
+    "Extract": "Save embedded images", "Audio": "Save the sound", "Mute": "Remove the sound",
+    "Frame": "Save a still as PNG", "Normalize": "Even out loudness", "Strip Tags": "Remove tags · cover art",
+    "Trim": "Cut the start or end", "Speed": "Faster or slower",
+    "Read QR": "Show what a code says", "Reorder": "Drag pages into order", "Extract Files": "Into a new folder",
+    "AirDrop": "Send to a nearby device", "Float": "Keep it handy to drag later", "Copy": "Copy to a folder…",
+    "Move": "Move to a folder…", "Copy Path": "Path to the clipboard", "Terminal": "Open a shell here",
+    "Zip": "Pack it all in a .zip",
 }
+# same tool name, different meaning for this kind of file
+CATEGORY_HINTS = {"video": {"Rotate": "Turn 90° clockwise", "Crop": "Cut away the edges"},
+                  "audio": {"Compress": "Lower the bitrate"}}
 FORMAT_HINTS = {"JPG": "Small, universal", "PNG": "Lossless · transparency", "WEBP": "Smallest for web",
                 "HEIC": "iPhone format", "TIFF": "Print · archival", "AVIF": "Next-gen, tiny",
                 "BMP": "Uncompressed", "PDF": "Document", "ICO": "Windows icon", "GIF": "Legacy web",
-                "DOCX": "Editable Word", "TXT": "Plain text"}
+                "DOCX": "Editable Word", "TXT": "Plain text",
+                "MP4": "Plays everywhere", "MOV": "Apple · editing", "MKV": "Keeps every track",
+                "WEBM": "Web video", "AVI": "Older players", "MP3": "Plays everywhere",
+                "M4A": "Apple · small", "WAV": "Uncompressed", "FLAC": "Lossless, smaller",
+                "OGG": "Open format", "OPUS": "Small, great quality", "AIFF": "Uncompressed · Apple",
+                "XLSX": "Excel workbook", "ODS": "OpenDocument sheet", "CSV": "Comma-separated",
+                "TSV": "Tab-separated", "PPTX": "PowerPoint", "EPUB": "Ebook", "MD": "Markdown",
+                "HTML": "Web page", "ZIP": "Opens everywhere", "TAR": "Unix · keeps permissions",
+                "TAR.GZ": "Smaller tar", "SRT": "Most players", "VTT": "Web video"}
+CATEGORY_FORMAT_HINTS = {"video": {"GIF": "Silent loop · 640 px", "MP3": "Sound only", "M4A": "Sound only · small",
+                                   "WAV": "Sound only · lossless"},
+                         "pdf": {"XLSX": "Tables to sheets", "PPTX": "One slide per page", "EPUB": "Reflowed ebook",
+                                 "MD": "Text with headings"},
+                         "sheet": {"CSV": "One file per sheet", "TSV": "One file per sheet", "PDF": "Printable table",
+                                   "DOCX": "Word table"},
+                         "slides": {"PDF": "One page per slide", "JPG": "One image per slide",
+                                    "PNG": "One image per slide"},
+                         "pages": {"PDF": "Printable copy"},
+                         "subtitle": {"TXT": "Dialogue only"},
+                         "svg": {"PDF": "Vector · sharp at any zoom"}}
 
-IMAGE_TOOLS = ["Compress", "Resize", "Crop", "Edit", "Annotate", "Redact", "Add BG", "Metadata"]
-PDF_TOOLS = ["Compress", "Split", "Rotate", "Protect", "Extract", "Metadata"]
+IMAGE_TOOLS = ["Compress", "Resize", "Crop", "Edit", "Annotate", "Redact", "Add BG", "Metadata", "Read QR"]
+PDF_TOOLS = ["Compress", "Split", "Rotate", "Protect", "Extract", "Metadata", "Reorder"]
+ARCHIVE_TOOLS = ["Extract Files"]
+# tool name -> (function run on each file, spinner text), or the tool window that opens instead
+MEDIA_TOOLS = {
+    "video": {"Compress": compress.video_window, "Trim": media_windows.TrimWindow,
+              "Crop": media_windows.VideoCropWindow, "Speed": media_windows.SpeedWindow,
+              "Audio": (media.extract_audio, "Extracting audio…"), "Mute": (media.mute, "Removing sound…"),
+              "Frame": media_windows.FrameWindow, "Rotate": (media.rotate, "Rotating…")},
+    "audio": {"Compress": compress.audio_window, "Trim": media_windows.TrimWindow,
+              "Speed": media_windows.SpeedWindow, "Normalize": (media.normalize, "Evening out volume…"),
+              "Strip Tags": (media.strip_metadata, "Removing tags…")},
+}
 
 
 # ---------------------------------------------------------------- background jobs
 class _Sig(QObject):
     done = Signal(object)
     failed = Signal(str)
+    progress = Signal(float)
 
 
 class Job(QRunnable):
@@ -60,10 +107,12 @@ class Job(QRunnable):
         super().__init__()
         self.action, self.srcs, self.fn, self.extra = action, srcs, fn, extra
         self.sig = _Sig()
+        self.cancel = threading.Event()
 
     def run(self):
         try:
-            outs = self.fn() or []
+            with media.reporting(self.sig.progress.emit, self.cancel):
+                outs = self.fn() or []
             self.sig.done.emit(report.summarize(self.action, self.srcs, outs, self.extra))
         except UserError as e:
             self.sig.failed.emit(str(e))
@@ -82,6 +131,30 @@ def friendly_error(e: Exception) -> str:
     if isinstance(e, FileNotFoundError):
         return "The file was moved or deleted."
     return msg
+
+
+def tool_items(names: list[str], cat: str, kind: str = "tool") -> list[Item]:
+    hints = {**HINTS, **CATEGORY_HINTS.get(cat, {})}
+    return [Item(n, GLYPHS[n], key=f"{kind}:{n}", hint=hints[n]) for n in names]
+
+
+def file_category(path: str) -> str | None:
+    """Category for Convert/Tools; folders have none (even one called "Photos.png")."""
+    return None if os.path.isdir(path) else category(path)
+
+
+def archive_items(paths: list[str]) -> list[Item]:
+    """Archive formats for a selection nothing else converts (folders, unknown files): one
+    archive of everything."""
+    n = len(paths)
+    return [Item(t, key=f"archive:{t}", hint=f"{n} items → 1 {t}" if n > 1 else FORMAT_HINTS[t])
+            for t in archives.TARGETS]
+
+
+def primary_category(paths: list[str]) -> str | None:
+    """Convert/Tools follow the first item they can handle; the rest of the selection only
+    gets the Actions ring."""
+    return next((c for c in map(file_category, paths) if c is not None), None)
 
 
 # ---------------------------------------------------------------- icon
@@ -136,6 +209,7 @@ class DragShiftApp(QObject):
         self.pool = QThreadPool.globalInstance()
         self.windows: list[QWidget] = []
         self.toasts = ToastStack()
+        self.floats = Floats()
         self.menu = RadialMenu(self.build_rings, self.describe)
         self.menu.activated.connect(self.run_item)
 
@@ -143,18 +217,18 @@ class DragShiftApp(QObject):
         # Send To) must not be closed just because no mouse button is held
         self.watcher = DragShiftWatcher(lambda: self.menu.isVisible() and not self.menu.click_mode,
                                         lambda: self.menu.got_drag, self)
-        self.watcher.set_key(self.settings.get("trigger"))
-        self.watcher.show_menu.connect(lambda pos: self.menu.popup(pos))
-        self.watcher.toggle_ring.connect(self.menu.next_ring)
+        self.apply_keys()
+        self.watcher.show_menu.connect(
+            lambda pos, ring: self.menu.popup(pos, ring=ring, dragged=self.watcher.drag_paths()))
+        self.watcher.switch_ring.connect(self.menu.ring_key)
+        self.watcher.nav_key.connect(self.menu.nav)
         self.watcher.hide_menu.connect(self.menu.close_menu)
         self.watcher.start()
 
         # files handed over by "Send to", the right-click menu, or a second launch
         self._pending: list[str] = []
         self._pending_timer = QTimer(self, singleShot=True, interval=280, timeout=self._flush_pending)
-        self.server = QLocalServer(self)
-        QLocalServer.removeServer(IPC_NAME)
-        self.server.listen(IPC_NAME)
+        self.server = listen_ipc(IPC_NAME, self)
         self.server.newConnection.connect(self._ipc)
 
         self.tray = QSystemTrayIcon(make_tray_icon(), self)
@@ -177,7 +251,15 @@ class DragShiftApp(QObject):
         self.tray.show()
 
     def trigger_label(self) -> str:
-        return dict(TRIGGERS).get(self.settings.get("trigger"), "Shift")
+        return self.settings.key_label("Convert")
+
+    def apply_keys(self):
+        """Hand the wheel -> key map to the watcher, and key glyphs to the hub hint."""
+        keys = self.settings.key_map()
+        self.watcher.set_keys(keys)
+        glyphs = key_glyphs()
+        self.menu.ring_keys = {wheel: glyphs.get(key, "") for wheel, key in keys.items()}
+        self.menu.wheel_keys = dict(keys)
 
     # ------------------------------------------------------------ IPC
     def _ipc(self):
@@ -199,11 +281,13 @@ class DragShiftApp(QObject):
             except Exception:
                 return  # incomplete: wait for more
             done["v"] = True
-            files = [f for f in data.get("files", []) if os.path.exists(f)]
-            print(f"IPC: {len(files)} file(s) handed over", flush=True)
+            request = ipc_request(data)
+            files, show = request or ([], False)
+            print("IPC: ignored a message that isn't from DragShift" if request is None
+                  else f"IPC: {len(files)} file(s) handed over", flush=True)
             if files:
                 self.queue_files(files)
-            elif data.get("show"):
+            elif show:
                 self.toasts.info("DragShift is already running",
                                  f"Drag any file and press {self.trigger_label()}. It lives in the tray.")
             sock.disconnectFromServer()
@@ -230,34 +314,50 @@ class DragShiftApp(QObject):
     # ------------------------------------------------------------ menu contents
     def describe(self, paths: list[str]) -> str:
         if len(paths) > 1:
-            return f"{len(paths)} files"
+            noun = "items" if any(os.path.isdir(p) for p in paths) else "files"
+            return f"{len(paths)} {noun}"
+        if os.path.isdir(paths[0]):
+            return "Folder"
         return human_size(file_size(paths[0]))
 
     def build_rings(self, paths: list[str]) -> dict[str, list[Item]]:
-        cat = category(paths[0])
+        """Convert and Tools when the first file DragShift can handle has them; Actions for
+        anything, folders and unsupported files included."""
+        actions_ring = {"Actions": tool_items(actions.available(), "", kind="action")}
+        cat = primary_category(paths)
         if cat is None:
-            return {"Unsupported": []}
-        ext = Path(paths[0]).suffix
-        same = [p for p in paths if category(p) == cat]
+            return {"Convert": archive_items(paths), **actions_ring}
+        same = [p for p in paths if file_category(p) == cat]
+        ext = archives.archive_suffix(same[0]) if cat == "archive" else Path(same[0]).suffix
         convert_items = []
+        format_hints = {**FORMAT_HINTS, **CATEGORY_FORMAT_HINTS.get(cat, {})}
         for t in convert.targets_for(cat, ext):
-            hint = FORMAT_HINTS.get(t, "")
+            hint = format_hints.get(t, "")
             if cat == "image" and t == "PDF" and len(same) > 1:
                 hint = f"{len(same)} images → 1 PDF"
             convert_items.append(Item(t, key=f"convert:{t}", hint=hint))
         rings: dict[str, list[Item]] = {"Convert": convert_items}
         if cat == "image":
-            rings["Tools"] = [Item(n, GLYPHS[n], key=f"tool:{n}", hint=HINTS[n]) for n in IMAGE_TOOLS]
+            rings["Tools"] = tool_items(IMAGE_TOOLS, cat)
         elif cat == "pdf":
-            names = PDF_TOOLS[:3] + (["Merge"] if len(same) > 1 else []) + PDF_TOOLS[3:]
-            rings["Tools"] = [Item(n, GLYPHS[n], key=f"tool:{n}", hint=HINTS[n]) for n in names]
-        return rings
+            rings["Tools"] = tool_items(PDF_TOOLS[:3] + (["Merge"] if len(same) > 1 else []) + PDF_TOOLS[3:], cat)
+        elif cat in MEDIA_TOOLS:
+            rings["Tools"] = tool_items(list(MEDIA_TOOLS[cat]), cat)
+        elif cat == "archive":
+            rings["Tools"] = tool_items(ARCHIVE_TOOLS, cat)
+        return {**rings, **actions_ring}
 
     # ------------------------------------------------------------ actions
     def run_item(self, item: Item, paths: list[str]):
-        cat = category(paths[0])
-        paths = [p for p in paths if category(p) == cat]
         kind, name = item.key.split(":", 1)
+        if kind == "action":
+            self.run_action(name, paths)
+            return
+        if kind == "archive":       # the whole selection, folders included
+            self.make_archive(name, paths)
+            return
+        cat = primary_category(paths)
+        paths = [p for p in paths if file_category(p) == cat]
         if kind == "convert":
             if cat == "image" and name == "PDF" and len(paths) > 1:
                 self.submit(f"convert:{name}", paths, lambda: convert.images_to_single_pdf(paths),
@@ -267,6 +367,19 @@ class DragShiftApp(QObject):
                 self.submit(f"convert:{name}", paths,
                             lambda: [o for p in paths for o in convert.convert(p, cat, name)], verb)
             return
+        if cat in MEDIA_TOOLS:
+            tool = MEDIA_TOOLS[cat][name]
+            if isinstance(tool, tuple):
+                fn, working = tool
+                self.submit(f"tool:{name}", paths, lambda: [fn(p) for p in paths], working)
+            elif name == "Compress":   # the one media window that takes the whole selection
+                self.open_tool(name, lambda: tool(paths, self.notify))
+            else:
+                self.open_tool(name, lambda: tool(paths[0], self.notify))
+            return
+        if cat == "archive":
+            self.submit("tool:Extract Files", paths, lambda: [archives.extract(p) for p in paths], "Extracting…")
+            return
         if cat == "pdf":
             if name == "Merge":
                 self.submit("tool:Merge", paths, lambda: [imaging.merge_pdfs(paths)], "Merging…")
@@ -274,28 +387,97 @@ class DragShiftApp(QObject):
                 self.open_window(tools.MetadataWindow(paths[0], self.notify, is_pdf=True))
             elif name == "Protect":
                 self.open_window(tools.ProtectWindow(paths[0], self.notify))
+            elif name == "Compress":
+                self.open_tool(name, lambda: compress.pdf_window(paths, self.notify))
+            elif name == "Reorder":
+                self.open_tool(name, lambda: ReorderWindow(paths[0], self.notify))
             else:
-                fns = {"Compress": lambda p: [imaging.compress_pdf(p)], "Split": imaging.split_pdf,
-                       "Rotate": lambda p: [imaging.rotate_pdf(p)], "Extract": imaging.extract_pdf_images}
+                fns = {"Split": imaging.split_pdf, "Rotate": lambda p: [imaging.rotate_pdf(p)],
+                       "Extract": imaging.extract_pdf_images}
                 f = fns[name]
                 self.submit(f"tool:{name}", paths, lambda: [o for p in paths for o in f(p)],
-                            {"Compress": "Compressing…", "Split": "Splitting…", "Rotate": "Rotating…",
-                             "Extract": "Extracting images…"}[name])
+                            {"Split": "Splitting…", "Rotate": "Rotating…", "Extract": "Extracting images…"}[name])
             return
         windows = {"Crop": tools.CropWindow, "Add BG": tools.AddBgWindow, "Annotate": tools.AnnotateWindow,
-                   "Redact": tools.RedactWindow, "Edit": tools.EditWindow, "Metadata": tools.MetadataWindow}
+                   "Redact": tools.RedactWindow, "Edit": tools.EditWindow, "Metadata": tools.MetadataWindow,
+                   "Read QR": qr.QrWindow}
+        if name == "Compress":
+            self.open_tool(name, lambda: tools.CompressWindow(paths, self.notify))
+        elif name == "Resize":
+            self.open_tool(name, lambda: tools.ResizeWindow(paths, self.notify))
+        else:
+            self.open_tool(name, lambda: windows[name](paths[0], self.notify))
+
+    def open_tool(self, name: str, make):
+        """Build a tool window and show it; a file it can't read becomes an error card."""
         try:
-            if name == "Compress":
-                self.open_window(tools.CompressWindow(paths, self.notify))
-            elif name == "Resize":
-                self.open_window(tools.ResizeWindow(paths, self.notify))
-            else:
-                self.open_window(windows[name](paths[0], self.notify))
+            self.open_window(make())
         except UserError as e:
             self.toasts.error(f"Couldn't open {name}", str(e))
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             self.toasts.error(f"Couldn't open {name}", friendly_error(e))
+
+    def run_action(self, name: str, paths: list[str]):
+        """Actions work on every dragged item: files of any type, folders, mixed selections."""
+        try:
+            if name == "AirDrop":
+                actions.airdrop(paths)
+            elif name == "Float":
+                self.floats.open(paths)
+            elif name in ("Copy", "Move"):
+                self.copy_or_move(name, paths)
+            elif name == "Copy Path":
+                actions.copy_paths(paths)
+                self.toasts.info("Copied path" if len(paths) == 1 else f"Copied {len(paths)} paths",
+                                 actions.path_text(paths), 2500)
+            elif name == "Terminal":
+                actions.open_terminal(paths)
+            elif name == "Zip":
+                self.make_archive("ZIP", paths)
+        except UserError as e:
+            self.toasts.error(f"Couldn't {actions.VERBS[name]}", str(e))
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            self.toasts.error(f"Couldn't {actions.VERBS[name]}", friendly_error(e))
+
+    def make_archive(self, fmt: str, paths: list[str]):
+        """One archive of every dragged item (files and folders), beside the first one."""
+        self.submit(f"archive:{fmt}", paths, lambda: [archives.create(paths, fmt)], "Compressing…")
+
+    def copy_or_move(self, name: str, paths: list[str]):
+        """Ask for a folder (starting at the last one used), then copy or move in the background.
+        Copy's Undo moves the copies to the Trash; Move's Undo moves the items back."""
+        if IS_MAC:
+            from . import platform_mac
+            platform_mac.activate()   # a menu-bar app's dialog would open behind other windows
+        last = self.settings.get("last_folder")
+        what = Path(paths[0]).name if len(paths) == 1 else self.describe(paths)
+        dest = QFileDialog.getExistingDirectory(None, f"{name} {what} to",
+                                                last if last and os.path.isdir(last) else QDir.homePath())
+        if not dest:
+            return
+        self.settings.set("last_folder", dest)
+        folder = Path(dest).name or dest
+        if name == "Copy":
+            copied: list[Path] = []
+
+            def copy() -> list[Path]:
+                copied.extend(actions.copy_to(paths, dest))
+                return copied
+
+            # prune=False: never remove the user's destination folder, even if it ends up empty
+            self.submit("action:Copy", paths, copy, "Copying…", extra=folder,
+                        undo=lambda: trash_message(trash(copied, prune=False)))
+        else:
+            moves = actions.Moves()
+
+            def undo_move() -> str:
+                n = actions.undo_move(moves)
+                return f"Moved {plural(n, 'item')} back"
+
+            self.submit("action:Move", paths, lambda: actions.move_to(paths, dest, moves), "Moving…",
+                        extra=folder, undo=undo_move)
 
     def open_window(self, w: QWidget):
         if hasattr(w, "submit"):
@@ -307,33 +489,54 @@ class DragShiftApp(QObject):
         else:
             w.show()
 
-    def submit(self, action: str, srcs: list, fn, working: str = "Working…", extra: str = ""):
-        """Run in the background. A spinner card appears only if it takes > 150 ms."""
-        state = {"card": None, "finished": False}
+    def submit(self, action: str, srcs: list, fn, working: str = "Working…", extra: str = "", undo=None):
+        """Run in the background. A spinner card appears only if it takes > 150 ms; jobs that
+        report progress (ffmpeg) show a percentage, and closing the card cancels them.
+        `undo` replaces the result card's default Undo (moving the outputs to the Trash)."""
+        state = {"card": None, "finished": False, "cancelled": False}
         names = Path(srcs[0]).name if len(srcs) == 1 else f"{len(srcs)} files"
+        job = Job(action, srcs, fn, extra)
+
+        def cancel():
+            state["cancelled"] = True
+            job.cancel.set()
+
+        def forget(_card):  # the card was closed or pushed off the stack: don't touch it again
+            state["card"] = None
 
         def show_spinner():
             if not state["finished"]:
-                state["card"] = self.toasts.new()
-                state["card"].working(working, names)
+                card = state["card"] = self.toasts.new()
+                card.working(working, names)
+                card.cancel_requested.connect(cancel)
+                card.closed.connect(forget)
+
+        def progressed(frac):
+            if state["card"] is not None and not state["finished"]:
+                state["card"].working(f"{working} {frac:.0%}", names)
 
         QTimer.singleShot(150, show_spinner)
-        job = Job(action, srcs, fn, extra)
 
         def done(r):
             release(job)
             state["finished"] = True
+            if undo is not None:
+                r.undo = undo
             card = state["card"] or self.toasts.new()
             card.done(r)
 
         def failed(msg):
             release(job)
             state["finished"] = True
+            if state["cancelled"]:
+                self.toasts.info("Cancelled", names, 2500)
+                return
             card = state["card"] or self.toasts.new()
             card.error("Couldn't finish", msg)
 
         job.sig.done.connect(done)
         job.sig.failed.connect(failed)
+        job.sig.progress.connect(progressed)
         self.pool.start(keep(job))
 
     def notify(self, action: str, srcs: list, outs: list, extra: str = ""):
@@ -363,11 +566,11 @@ class DragShiftApp(QObject):
         self.open_window(w)
 
     def _settings_changed(self):
-        self.watcher.set_key(self.settings.get("trigger"))
+        self.apply_keys()
         self.tray.setToolTip(f"{APP_NAME} — press {self.trigger_label()} while dragging a file")
 
     def show_welcome(self):
-        self.open_window(WelcomeWindow(self.settings, self.trigger_label()))
+        self.open_window(WelcomeWindow(self.settings))
 
 
 class DragShiftQApplication(QApplication):
@@ -399,6 +602,29 @@ def mac_setup(qapp):
         platform_mac.become_accessory()
     except Exception:
         pass
+
+
+def listen_ipc(name: str, parent=None) -> QLocalServer:
+    """The server a second launch hands its files to. On macOS and Linux it's a socket file, and
+    UserAccessOption (set before listen) makes it this user's only: no other account on the
+    machine can connect and send files."""
+    server = QLocalServer(parent)
+    if not IS_WIN:
+        server.setSocketOptions(QLocalServer.UserAccessOption)
+    QLocalServer.removeServer(name)
+    server.listen(name)
+    return server
+
+
+def ipc_request(data) -> tuple[list[str], bool] | None:
+    """(files that exist, show) from a hand-off message ({"files": [...]} or {"show": true}),
+    None for anything else: the socket takes whatever a local program sends."""
+    if not isinstance(data, dict):
+        return None
+    files, show = data.get("files", []), data.get("show", False)
+    if not isinstance(files, list) or not all(isinstance(f, str) for f in files) or not isinstance(show, bool):
+        return None
+    return [f for f in files if os.path.exists(f)], show
 
 
 def send_to_running(payload: dict) -> bool:
@@ -465,6 +691,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     app = DragShiftApp(qapp)
     qapp.file_opened.connect(lambda f: app.queue_files([f]))
+    if IS_MAC:  # Finder > Services > "Open in DragShift", or the shortcut the user gave it
+        from . import platform_mac
+        platform_mac.register_services(app.queue_files)
     if qapp.early_files:
         app.queue_files(list(qapp.early_files))
     if files:  # e.g. "Send to → DragShift" or drag onto the .exe
@@ -475,6 +704,51 @@ def main(argv: list[str] | None = None) -> int:
         QTimer.singleShot(400, lambda: app.toasts.info(
             "DragShift is running", f"Drag any file, then press {app.trigger_label()}."))
     return qapp.exec()
+
+
+def selftest_documents(d: Path, docx: Path):
+    """Office, ebook and text formats: one pass through every reader and writer library."""
+    (d / "s.csv").write_text("name,qty\nZürich,3\n", encoding="utf-8")
+    for t in convert.targets_for("sheet", ".csv"):
+        convert.convert(d / "s.csv", "sheet", t)
+    (d / "m.md").write_text("# Title\n\n- one\n- two\n", encoding="utf-8")
+    epub = convert.convert(d / "m.md", "markdown", "EPUB")[0]
+    for t in convert.targets_for("epub", ".epub"):
+        convert.convert(epub, "epub", t)
+    for t in ("MD", "HTML"):
+        convert.convert(docx, "docx", t)
+    from pptx import Presentation
+    deck = Presentation()
+    deck.slides.add_slide(deck.slide_layouts[0]).shapes.title.text = "Hello"
+    deck.save(d / "deck.pptx")
+    for t in convert.targets_for("slides", ".pptx"):
+        convert.convert(d / "deck.pptx", "slides", t)
+    pdf = convert.convert(d / "deck.pptx", "slides", "PDF")[0]
+    for t in convert.PDF_TARGETS:
+        convert.convert(pdf, "pdf", t)
+
+
+def selftest_extras(d: Path):
+    """SVG (QtSvg plugin), QR (zxing-cpp native module), archives and subtitles."""
+    from . import archives, qr, subtitles
+    (d / "v.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30">'
+                             '<rect width="40" height="30" fill="red"/></svg>', encoding="utf-8")
+    for t in convert.targets_for("svg", ".svg"):
+        convert.convert(d / "v.svg", "svg", t)
+    import numpy as np
+    import zxingcpp
+    from PIL import Image
+    code = zxingcpp.write_barcode_to_image(zxingcpp.create_barcode("DragShift", zxingcpp.BarcodeFormat.QRCode), scale=4)
+    Image.fromarray(np.asarray(code)).save(d / "q.png")
+    if [c.text for c in qr.decode(d / "q.png")] != ["DragShift"]:
+        raise RuntimeError("QR decode returned the wrong text")
+    zipped = archives.create([d / "v.svg", d / "q.png"], "ZIP")
+    archives.convert(zipped, "TAR.GZ")
+    if not (archives.extract(zipped) / "q.png").exists():
+        raise RuntimeError("extracted archive is missing a file")
+    (d / "s.srt").write_text("1\n00:00:01,000 --> 00:00:02,500\nHello\n", encoding="utf-8")
+    for t in subtitles.targets_for(".srt"):
+        subtitles.convert(d / "s.srt", t)
 
 
 def selftest() -> int:
@@ -488,14 +762,28 @@ def selftest() -> int:
             for t in convert.targets_for("image", ".png"):
                 convert.convert(src, "image", t)
             pdf = convert.convert(src, "image", "PDF")[0]
-            for t in convert.PDF_TARGETS:
+            for t in ("JPG", "PNG", "DOCX", "TXT"):  # a picture-only PDF; text targets run in selftest_documents
                 convert.convert(pdf, "pdf", t)
             (Path(d) / "n.txt").write_text("hello")
             docx = convert.convert(Path(d) / "n.txt", "text", "DOCX")[0]
             convert.convert(docx, "docx", "TXT")
+            selftest_documents(Path(d), docx)
+            selftest_extras(Path(d))
             imaging.add_background(convert.open_image(src), imaging.Background())
             imaging.compress_pdf(pdf)
             imaging.protect_pdf(pdf, "pw")
+            if media.available():
+                clip = media.make_test_clip(Path(d) / "clip.mp4")
+                for t in convert.targets_for("video", ".mp4"):
+                    convert.convert(clip, "video", t)
+                for tool in MEDIA_TOOLS["video"].values():
+                    if isinstance(tool, tuple):
+                        tool[0](clip)
+                    else:
+                        tool(str(clip), lambda *a, **k: None).close()
+                print(f"ffmpeg OK: {media.find_tool('ffmpeg')}")
+            else:
+                print("ffmpeg not found: video and audio skipped")
             from . import liquid
             liquid.render(Image.new("RGB", (80, 80)), liquid.sdf_circle(80, 80, 40, 40, 30))
             menu = RadialMenu(lambda p: {"Convert": [Item("PNG")]}, lambda p: "1 KB")

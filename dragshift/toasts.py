@@ -1,11 +1,11 @@
-"""Liquid-glass notifications, bottom-right, stacked.
+"""Notifications styled as macOS notification banners (top-right on macOS, with the real
+banner material; bottom-right glass cards elsewhere), stacked.
 
 A card appears immediately while work runs (spinner), then turns into the result:
 thumbnail, what changed (e.g. "2.4 MB → 610 KB · 75% smaller") and actions:
-Open · Show in folder · Undo (moves the new files to the Recycle Bin)."""
+Open · Show in Finder/folder · Undo (moves the new files to the Trash / Recycle Bin)."""
 from __future__ import annotations
 
-import math
 import os
 import subprocess
 import sys
@@ -13,16 +13,20 @@ from pathlib import Path
 
 from PySide6.QtCore import (QEasingCurve, QFile, QPointF, QRect, QRectF, Qt, QTimer, QUrl,
                             QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QFont, QFontMetrics,
+from PySide6.QtGui import (QCursor, QDesktopServices, QFontMetrics,
                            QGuiApplication, QPainter, QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import QWidget
 
-from . import glass
+from . import controls, design, glass
 from .report import Result
+from .util import plural
 
-W, H = 380, 104
-GAP = 10
-MARGIN = 18
+W, H = 356, 96        # macOS banner width; tall enough for two body lines + actions
+GAP = 8
+MARGIN = 16           # from the screen edge (macOS: right edge, below the menu bar)
+PAD = 14              # inside the banner
+LEAD = 36             # leading image (thumbnail / symbol), like a banner's app icon
+CLOSE = QRectF(4, 4, 20, 20)   # banner close button, shown on hover (top-left, as on macOS)
 
 
 def reveal(path: str | Path):
@@ -41,11 +45,16 @@ def open_file(path: str | Path):
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
-def trash(paths: list[Path]) -> int:
+def trash(paths: list[Path], prune: bool = True) -> int:
+    """Move results to the Trash. `prune` also removes output folders left empty (only for
+    folders DragShift made, like "x images/"; never for a folder the user picked)."""
     n = 0
     for p in paths:
         p = Path(p)
-        if p.is_file():
+        if p.is_dir() and not p.is_symlink():   # a copied folder: only ever to the Trash
+            if QFile.moveToTrash(str(p)):
+                n += 1
+        elif p.is_file():
             if QFile.moveToTrash(str(p)):
                 n += 1
             else:
@@ -55,7 +64,7 @@ def trash(paths: list[Path]) -> int:
                 except OSError:
                     pass
     # remove now-empty output folders we created (e.g. "x images/")
-    for d in {Path(p).parent for p in paths}:
+    for d in ({Path(p).parent for p in paths} if prune else ()):
         try:
             if d.is_dir() and not any(d.iterdir()):
                 d.rmdir()
@@ -64,8 +73,14 @@ def trash(paths: list[Path]) -> int:
     return n
 
 
+def trash_message(n: int) -> str:
+    bin_name = "Recycle Bin" if sys.platform == "win32" else "Trash"
+    return f"Moved {plural(n, 'item')} to the {bin_name}"
+
+
 class ToastCard(QWidget):
     closed = Signal(object)
+    cancel_requested = Signal()   # the user closed a card while its job was still working
 
     def __init__(self, stack: "ToastStack"):
         super().__init__(None)
@@ -85,11 +100,13 @@ class ToastCard(QWidget):
         self.spin = 0.0
         self.hover_btn = -1
         self.buttons: list[tuple[str, QRectF]] = []
+        self.hovered = False
         self._fade = 0.0
+        self._vibrant = False
         from .liquid import GlassStyle
         self.liquid = glass.LiquidBacking(self, 20, GlassStyle(blur=8, strength=12, bezel=16))
         self.liquid.changed.connect(self.update)
-        self.fade = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=200,
+        self.fade = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=design.duration("standard"),
                                       easingCurve=QEasingCurve.OutCubic)
         self.fade.valueChanged.connect(self._set_fade)
         self.spinner = QTimer(self, interval=16, timeout=self._spin)
@@ -109,7 +126,8 @@ class ToastCard(QWidget):
         if r.thumb is not None:
             pm = QPixmap(str(r.thumb))
             if not pm.isNull():
-                self.thumb = pm.scaled(64, 64, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                px = int(LEAD * self.devicePixelRatioF())
+                self.thumb = pm.scaled(px, px, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         self.life.start(6500)
         self.update()
 
@@ -136,17 +154,26 @@ class ToastCard(QWidget):
 
     def appear(self, rect: QRect):
         self.setGeometry(rect)
-        glass.apply_shape(self, glass.rounded_rect_path(QRectF(0, 0, W, H), 20))
-        self.liquid.capture_at(rect)
+        radius = design.RADIUS["banner"]
+        glass.apply_shape(self, glass.rounded_rect_path(QRectF(0, 0, W, H), radius))
+        native = controls.native()
+        if not native:
+            self.liquid.capture_at(rect)
         self.setWindowOpacity(0.0)
         self.show()
-        self.liquid.excluded = glass.exclude_from_capture(int(self.winId()))
+        if native:   # the real banner material: live blur, light/dark, Reduce transparency
+            self._vibrant = design._mac().add_vibrancy(self, "popover", radius=radius, follow_active=False)
+        else:
+            self.liquid.excluded = glass.exclude_from_capture(int(self.winId()))
+        self.fade.setDuration(design.duration("standard"))
         self.fade.start()
 
     def relocate(self, rect: QRect):
         if rect == self.geometry():
             return
         self.setGeometry(rect)
+        if self._vibrant:
+            return
         if self.liquid.excluded:
             self.liquid.refresh()
         else:
@@ -163,9 +190,12 @@ class ToastCard(QWidget):
     # ------------------------------------------------------------ input
     def enterEvent(self, e):
         self.life.stop()
+        self.hovered = True
+        self.update()
 
     def leaveEvent(self, e):
         self.hover_btn = -1
+        self.hovered = False
         if self.state in ("done", "info"):
             self.life.start(2500)
         elif self.state == "error":
@@ -179,11 +209,12 @@ class ToastCard(QWidget):
                 hb = i
         if hb != self.hover_btn:
             self.hover_btn = hb
-            self.setCursor(Qt.PointingHandCursor if hb >= 0 else Qt.ArrowCursor)
             self.update()
 
     def mouseReleaseEvent(self, e):
-        if QRectF(W - 30, 6, 24, 24).contains(e.position()):
+        if CLOSE.adjusted(-4, -4, 4, 4).contains(e.position()):
+            if self.state == "working":
+                self.cancel_requested.emit()
             self.dismiss()
             return
         for name, r in self.buttons:
@@ -205,120 +236,127 @@ class ToastCard(QWidget):
             reveal(r.outs[0])
             self.dismiss()
         elif name == "Undo":
-            n = trash(r.outs)
+            detail = r.undo() if r.undo is not None else trash_message(trash(r.outs))
             self.result = None
             self.thumb = None
             self.good = ""
-            bin_name = "Recycle Bin" if sys.platform == "win32" else "Trash"
-            self.info("Undone", f"Moved {n} file{'s' if n != 1 else ''} to the {bin_name}", 2500)
+            self.info("Undone", detail, 2500)
 
     # ------------------------------------------------------------ paint
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        radius = design.RADIUS["banner"]
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        path = glass.rounded_rect_path(r, 20)
-        img = self.liquid.image
-        err = self.state == "error"
-        if img is not None and not img.isNull() and img.size() == self.size():
-            p.drawImage(0, 0, img)
-            tint = QColor(140, 30, 50, 150) if err else QColor(20, 16, 32, 120)
-        else:
-            tint = QColor(120, 30, 45, 230) if err else QColor(34, 27, 52, 232)
-        glass.paint_glass(p, path, tint=tint, rainbow_alpha=170)
+        path = glass.rounded_rect_path(r, radius)
+        self._paint_material(p, path)
 
-        x = 16
-        # leading visual: spinner / thumbnail / icon
-        lead = QRectF(14, (H - 56) / 2 - 8, 56, 56)
+        lead = QRectF(PAD, PAD, LEAD, LEAD)
+        self._paint_lead(p, lead)
+        x = lead.right() + 10
+        tw = W - x - PAD
+
+        # title, with the result figure (e.g. "75% smaller") where a banner shows its time
+        f = design.font("headline")
+        fm = QFontMetrics(f)
+        good_w = 0
+        if self.good:
+            fg = design.font("subheadline", 600)
+            good_w = QFontMetrics(fg).horizontalAdvance(self.good) + 8
+            p.setFont(fg)
+            p.setPen(design.color("greenText"))
+            p.drawText(QRectF(W - PAD - good_w, PAD, good_w, 17), Qt.AlignRight | Qt.AlignVCenter, self.good)
+        p.setFont(f)
+        p.setPen(design.color("label"))
+        p.drawText(QRectF(x, PAD, tw - good_w, 17), Qt.AlignLeft | Qt.AlignVCenter,
+                   fm.elidedText(self.title, Qt.ElideRight, int(tw - good_w)))
+
+        has_actions = self.state == "done" and self.result and self.result.outs
+        fb = design.font("body")
+        p.setFont(fb)
+        p.setPen(design.color("label" if not has_actions else "secondaryLabel"))
+        lines = 1 if has_actions else 2
+        body = QFontMetrics(fb).elidedText(self.detail, Qt.ElideMiddle, int(tw * lines * 0.97))
+        p.drawText(QRectF(x, PAD + 18, tw, 17 * lines), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, body)
+
+        self.buttons = []
+        if has_actions:
+            self._paint_actions(p, x)
+        if self.hovered:
+            self._paint_close(p)
+
+    def _paint_material(self, p: QPainter, path: QPainterPath):
+        if self._vibrant:     # NSVisualEffectView behind us does the material
+            p.setPen(QPen(design.color("separator", alpha=1.4), design.HAIRLINE))
+            p.drawPath(path)
+            return
+        img = self.liquid.image
+        if design.reduce_transparency():
+            p.fillPath(path, design.color("windowBackground"))
+        elif img is not None and not img.isNull() and img.size() == self.size():
+            p.drawImage(0, 0, img)
+            glass.paint_glass(p, path, tint=design.color("glassTint"), rainbow_alpha=0, highlight=0.6)
+        else:
+            glass.paint_glass(p, path, tint=design.color("glassTintSolid"), rainbow_alpha=0, highlight=0.6)
+        p.setPen(QPen(design.color("separator", alpha=1.4), design.HAIRLINE))
+        p.drawPath(path)
+
+    def _paint_lead(self, p: QPainter, lead: QRectF):
         if self.state == "working":
-            p.setPen(QPen(QColor(255, 255, 255, 50), 4))
-            p.drawEllipse(lead.center(), 16, 16)
-            p.setPen(glass.iridescent_pen(lead.center(), 4, 255, angle=-self.spin))
-            p.drawArc(QRectF(lead.center().x() - 16, lead.center().y() - 16, 32, 32), int(-self.spin * 16), 100 * 16)
-            x = 82
+            controls.paint_spinner(p, lead.center(), 11, self.spin / 360, design.color("secondaryLabel"))
         elif self.thumb is not None:
             clip = QPainterPath()
-            clip.addRoundedRect(lead, 12, 12)
+            clip.addRoundedRect(lead, design.RADIUS["group"], design.RADIUS["group"])
+            dpr = self.devicePixelRatioF()
+            side = int(LEAD * dpr)
             p.save()
             p.setClipPath(clip)
-            p.drawPixmap(lead.toRect(), self.thumb,
-                         QRect((self.thumb.width() - 64) // 2, (self.thumb.height() - 64) // 2, 64, 64))
+            p.drawPixmap(lead, self.thumb, QRectF((self.thumb.width() - side) / 2, (self.thumb.height() - side) / 2,
+                                                  side, side))
             p.restore()
-            p.setPen(QPen(QColor(255, 255, 255, 110), 1))
-            p.drawRoundedRect(lead, 12, 12)
-            x = 82
+            p.setPen(QPen(design.color("separator", alpha=2.0), design.HAIRLINE))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(clip)
         else:
-            icon = {"done": "✓", "error": "!", "info": "↺"}.get(self.state, "✓")
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(255, 255, 255, 34))
-            p.drawEllipse(lead.center(), 22, 22)
-            f = QFont("Segoe UI", 1)
-            f.setPixelSize(22)
-            f.setBold(True)
-            p.setFont(f)
-            p.setPen(QColor("#8dffb8") if self.state == "done" else QColor("#ffd36b") if err else QColor(255, 255, 255))
-            p.drawText(QRectF(lead.center().x() - 22, lead.center().y() - 22, 44, 44), Qt.AlignCenter, icon)
-            x = 82
+            sym, glyph, role = {"done": ("checkmark.circle.fill", "✓", "green"),
+                                "error": ("exclamationmark.triangle.fill", "!", "orange"),
+                                "info": ("info.circle.fill", "i", "accent")}.get(self.state, ("checkmark.circle.fill", "✓", "green"))
+            if self.state == "info" and self.title == "Undone":
+                sym = "arrow.uturn.backward.circle.fill"
+            pm = design.symbol(sym, 26, design.color(role), fallback=glyph)
+            if pm is not None:
+                sz = pm.deviceIndependentSize()
+                p.drawPixmap(QPointF(lead.center().x() - sz.width() / 2, lead.center().y() - sz.height() / 2), pm)
 
-        tw = W - x - 34
-        f = QFont("Segoe UI Variable Display", 1)
-        f.setPixelSize(15)
-        f.setBold(True)
+    def _paint_actions(self, p: QPainter, x: float):
+        names = ["Open", "Show", "Undo"]
+        show = "Show in Finder" if sys.platform == "darwin" else "Show in folder"
+        labels = {"Open": "Open", "Show": show, "Undo": "Undo"}
+        f = design.font("callout", 500)
         p.setFont(f)
         fm = QFontMetrics(f)
-        title = fm.elidedText(self.title, Qt.ElideRight, int(tw))
-        p.setPen(QColor(255, 255, 255))
-        p.drawText(QRectF(x, 13, tw, 20), Qt.AlignLeft | Qt.AlignVCenter, title)
-        # highlighted figure chip (e.g. "75% smaller")
-        if self.good:
-            gx = x + fm.horizontalAdvance(title) + 8
-            f2 = QFont("Segoe UI", 1)
-            f2.setPixelSize(11)
-            f2.setBold(True)
-            fm2 = QFontMetrics(f2)
-            gw = fm2.horizontalAdvance(self.good) + 14
-            if gx + gw < W - 34:
-                chip = QRectF(gx, 14, gw, 18)
+        bx = x
+        for i, nme in enumerate(names):
+            bw = fm.horizontalAdvance(labels[nme]) + 20
+            br = QRectF(bx, H - PAD - 22, bw, 22)
+            self.buttons.append((nme, br))
+            controls.glass_capsule(p, br, strong=self.hover_btn == i)
+            if self.hover_btn == i:
                 p.setPen(Qt.NoPen)
-                p.setBrush(QColor(80, 220, 140, 70))
-                p.drawRoundedRect(chip, 9, 9)
-                p.setFont(f2)
-                p.setPen(QColor("#a8ffc9"))
-                p.drawText(chip, Qt.AlignCenter, self.good)
-        f.setPixelSize(12)
-        f.setBold(False)
-        p.setFont(f)
-        p.setPen(QColor(255, 255, 255, 200))
-        p.drawText(QRectF(x, 35, tw + 18, 34), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
-                   QFontMetrics(f).elidedText(self.detail, Qt.ElideMiddle, int(tw * 1.9)))
+                p.setBrush(design.color("label", alpha=0.08))
+                p.drawRoundedRect(br, br.height() / 2, br.height() / 2)
+            p.setPen(design.color("label"))
+            p.drawText(br, Qt.AlignCenter, labels[nme])
+            bx += bw + 6
 
-        # close ×
-        f.setPixelSize(13)
-        p.setFont(f)
-        p.setPen(QColor(255, 255, 255, 150))
-        p.drawText(QRectF(W - 30, 6, 24, 24), Qt.AlignCenter, "✕")
-
-        # action buttons
-        self.buttons = []
-        if self.state == "done" and self.result and self.result.outs:
-            names = ["Open", "Show", "Undo"]
-            labels = {"Open": "Open", "Show": "Show in folder", "Undo": "Undo"}
-            f.setPixelSize(12)
-            f.setBold(True)
-            p.setFont(f)
-            fm = QFontMetrics(f)
-            bx = x
-            for i, nme in enumerate(names):
-                bw = fm.horizontalAdvance(labels[nme]) + 22
-                br = QRectF(bx, H - 32, bw, 22)
-                self.buttons.append((nme, br))
-                p.setPen(QPen(QColor(255, 255, 255, 120 if self.hover_btn == i else 60), 1))
-                p.setBrush(QColor(255, 255, 255, 60 if self.hover_btn == i else 26))
-                p.drawRoundedRect(br, 11, 11)
-                p.setPen(QColor(255, 255, 255))
-                p.drawText(br, Qt.AlignCenter, labels[nme])
-                bx += bw + 6
+    def _paint_close(self, p: QPainter):
+        controls.glass_capsule(p, CLOSE, strong=True)
+        pm = design.symbol("xmark", 8, design.color("secondaryLabel"), "bold", fallback="✕")
+        if pm is not None:
+            sz = pm.deviceIndependentSize()
+            p.drawPixmap(QPointF(CLOSE.center().x() - sz.width() / 2, CLOSE.center().y() - sz.height() / 2), pm)
 
 
 class ToastStack:
@@ -334,7 +372,10 @@ class ToastStack:
     def _slot(self, i: int) -> QRect:
         g = self._screen_rect()
         x = g.right() - W - MARGIN
-        y = g.bottom() - MARGIN - H - i * (H + GAP)
+        if sys.platform == "darwin":   # banners sit under the menu bar, stacking down
+            y = g.top() + 10 + i * (H + GAP)
+        else:
+            y = g.bottom() - MARGIN - H - i * (H + GAP)
         return QRect(x, y, W, H)
 
     def new(self) -> ToastCard:

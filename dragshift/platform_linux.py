@@ -1,6 +1,7 @@
 """Linux integration (X11 — XFCE, MATE, Cinnamon, KDE/GNOME on Xorg).
 
-* Trigger: XQueryPointer gives the global button + modifier state; XQueryKeymap gives Escape.
+* Trigger: XQueryPointer gives the global button + modifier state; XQueryKeymap gives Escape
+  and the wheel's arrow/Enter/Tab keys.
   No extra packages or permissions needed (plain libX11 via ctypes).
 * Compositing: XFCE often runs without a compositor (xfwm4 compositing off, or slow GPUs).
   Then translucent windows would show black corners, so callers shape windows with masks.
@@ -18,8 +19,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-BUTTON1, SHIFT, CONTROL, MOD1 = 1 << 8, 1 << 0, 1 << 2, 1 << 3
-KEY_MASKS = {"shift": SHIFT, "ctrl": CONTROL, "alt": MOD1}
+BUTTON1, SHIFT, CONTROL, MOD1, MOD4 = 1 << 8, 1 << 0, 1 << 2, 1 << 3, 1 << 6
+KEY_MASKS = {"shift": SHIFT, "ctrl": CONTROL, "alt": MOD1, "cmd": MOD4}
+# X keysyms for the wheel's keyboard control; "enter" is Return or keypad Enter
+KEYSYMS = {"left": (0xFF51,), "up": (0xFF52,), "right": (0xFF53,), "down": (0xFF54,),
+           "enter": (0xFF0D, 0xFF8D), "escape": (0xFF1B,), "tab": (0xFF09,)}
 
 
 class _X11:
@@ -50,7 +54,8 @@ class _X11:
             if not self.dpy:
                 return
             self.root = x.XDefaultRootWindow(self.dpy)
-            self.esc = x.XKeysymToKeycode(self.dpy, 0xFF1B)
+            self.codes = {name: [c for c in (x.XKeysymToKeycode(self.dpy, s) for s in syms) if c]
+                          for name, syms in KEYSYMS.items()}
             self.ok = True
         except Exception:
             self.ok = False
@@ -63,10 +68,10 @@ class _X11:
                              ctypes.byref(i), ctypes.byref(i), ctypes.byref(i), ctypes.byref(m))
         return m.value
 
-    def escape(self) -> bool:
+    def key(self, name: str) -> bool:
         keys = ctypes.create_string_buffer(32)
         self.x.XQueryKeymap(self.dpy, keys)
-        return bool(keys.raw[self.esc // 8] & (1 << (self.esc % 8)))
+        return any(keys.raw[c // 8] & (1 << (c % 8)) for c in self.codes.get(name, ()))
 
     def composited(self) -> bool:
         scr = self.x.XDefaultScreen(self.dpy)
@@ -102,8 +107,12 @@ def key_down(name: str) -> bool:
     return bool(x11().mask() & KEY_MASKS.get(name, SHIFT))
 
 
+def nav_down(name: str) -> bool:
+    return x11().key(name)
+
+
 def escape_down() -> bool:
-    return x11().escape()
+    return nav_down("escape")
 
 
 # ---------------------------------------------------------------- compositing

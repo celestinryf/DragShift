@@ -25,7 +25,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller pytest
+          pip install -r requirements-dev.txt pyinstaller
+
+      - name: Fetch pinned ffmpeg (bundled with the app; the tests use it too)
+        run: python packaging/ffmpeg/fetch.py --github-path
 
       - name: Run tests
         run: python -m pytest -q
@@ -45,6 +48,9 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
+          foreach ($f in @("ffmpeg.exe", "ffprobe.exe", "FFMPEG-NOTICE.txt")) {
+            if (-not (Test-Path "dist\DragShift\_internal\ffmpeg\$f")) { throw "ffmpeg bundle is missing $f" }
+          }
           foreach ($exe in @("dist\DragShift\DragShift.exe", "dist\DragShift.exe")) {
             $p = Start-Process -FilePath $exe -ArgumentList "--selftest" -Wait -PassThru
             if ($p.ExitCode -ne 0) { throw "Self-test failed for $exe ($($p.ExitCode))" }
@@ -109,7 +115,23 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller pytest
+          pip install -r requirements-dev.txt pyinstaller
+
+      # the LGPL ffmpeg is built from source on each runner (native arm64 or x86_64); the result is
+      # cached until packaging/ffmpeg/build_mac.py changes
+      - name: Cache the LGPL ffmpeg build
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/ffmpeg-build/*/out
+          key: ffmpeg-lgpl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packaging/ffmpeg/build_mac.py') }}
+
+      - name: Build tools for ffmpeg (only used to build, nothing is bundled)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: brew install pkgconf nasm
+
+      - name: Build pinned LGPL ffmpeg (bundled with the app; the tests use it too)
+        run: python packaging/ffmpeg/fetch.py --github-path
 
       - name: Run tests
         run: python -m pytest -q
@@ -123,6 +145,11 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
+          test -x dist/DragShift.app/Contents/Frameworks/ffmpeg/ffmpeg
+          test -x dist/DragShift.app/Contents/Frameworks/ffmpeg/ffprobe
+          if dist/DragShift.app/Contents/Frameworks/ffmpeg/ffmpeg -hide_banner -version | grep -E -- '--enable-(gpl|nonfree)'; then
+            echo "The bundled ffmpeg is not LGPL"; exit 1
+          fi
           dist/DragShift.app/Contents/MacOS/DragShift --selftest
           codesign --verify --deep --verbose=2 dist/DragShift.app || true
           /usr/libexec/PlistBuddy -c "Print :LSUIElement" dist/DragShift.app/Contents/Info.plist
@@ -203,8 +230,11 @@ jobs:
           python3 -m venv /opt/uv && /opt/uv/bin/pip install -q uv
           /opt/uv/bin/uv python install 3.12
           /opt/uv/bin/uv venv -p 3.12 /opt/venv
-          VIRTUAL_ENV=/opt/venv /opt/uv/bin/uv pip install -q -r requirements.txt pyinstaller pytest
+          VIRTUAL_ENV=/opt/venv /opt/uv/bin/uv pip install -q -r requirements-dev.txt pyinstaller
           /opt/venv/bin/python --version
+
+      - name: Fetch pinned ffmpeg (bundled with the app; the tests use it too)
+        run: /opt/venv/bin/python packaging/ffmpeg/fetch.py --github-path
 
       - name: Run tests
         env:
@@ -212,7 +242,10 @@ jobs:
         run: /opt/venv/bin/python -m pytest -q
 
       - name: Build the app folder
-        run: /opt/venv/bin/pyinstaller DragShift.spec --noconfirm
+        run: |
+          /opt/venv/bin/pyinstaller DragShift.spec --noconfirm
+          test -x dist/dragshift/_internal/ffmpeg/ffmpeg
+          test -x dist/dragshift/_internal/ffmpeg/ffprobe
 
       - name: Build the .deb
         run: |

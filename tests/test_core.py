@@ -99,4 +99,36 @@ def test_paths(tmp_path):
     f = tmp_path / "a.jpg"
     f.write_bytes(b"x")
     assert sibling(f, ext=".jpg").name == "a (1).jpg"
-    assert category("x.HEIC") == "image" and category("x.pdf") == "pdf" and category("x.zip") is None
+    assert category("x.HEIC") == "image" and category("x.pdf") == "pdf" and category("x.bin") is None
+
+
+def test_atomic_save_temp_name_is_short_and_cleaned_up(tmp_path):
+    """The temp name doesn't grow with the result's name: a 250-character name still saves."""
+    seen = []
+    out = tmp_path / ("a" * 246 + ".txt")
+    convert.atomic_save(lambda dst: (seen.append(Path(dst)), Path(dst).write_text("hi")), out)
+    assert out.read_text() == "hi" and len(seen[0].name) < 20 and seen[0].parent == tmp_path
+    assert sorted(p.name for p in tmp_path.iterdir()) == [out.name]
+
+
+def test_atomic_save_too_long_name_is_a_user_error(tmp_path):
+    from dragshift.util import UserError
+    out = tmp_path / ("a" * 300 + ".txt")
+    with pytest.raises(UserError, match="name is too long"):
+        convert.atomic_save(lambda dst: Path(dst).write_text("hi"), out)
+    with pytest.raises(UserError, match="name is too long"):
+        sibling(out, ext=".pdf")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_bytes_and_text(tmp_path):
+    convert.save_bytes(tmp_path / "a.bin", b"\0\1")
+    convert.save_text(tmp_path / "b.txt", "x\ny", newline="\n")
+    assert (tmp_path / "a.bin").read_bytes() == b"\0\1" and (tmp_path / "b.txt").read_bytes() == b"x\ny"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.bin", "b.txt"]
+
+
+def test_plural():
+    from dragshift.util import plural
+    assert plural(1, "file") == "1 file" and plural(0, "file") == "0 files" and plural(2, "file") == "2 files"
+    assert plural(1, "child", "children") == "1 child" and plural(3, "child", "children") == "3 children"

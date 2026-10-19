@@ -10,26 +10,29 @@ from pathlib import Path
 from typing import Callable
 
 from PIL import Image
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import (QColor, QDesktopServices, QFont, QGuiApplication, QImage, QKeySequence,
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QUrl
+from PySide6.QtGui import (QColor, QDesktopServices, QGuiApplication, QImage, QKeySequence,
                            QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QShortcut)
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QColorDialog, QComboBox, QFrame,
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QPushButton, QSlider, QSpinBox, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
-from . import imaging
+from . import controls, design, imaging
 from .convert import open_image, open_preview
 from .glass import pil_from_qimage, qimage_from_pil
-from .util import file_size, human_size, sibling
+from .util import file_size, human_size, plural, sibling
 from .window import GlassWindow, ImageView
 
 Notify = Callable[..., None]
+PERCENT_RANGE = (10, 90)   # "compress to N% of the original" (images here, PDFs and media in compress.py)
+PERCENT_DEFAULT = 50
 
 
 # ---------------------------------------------------------------- small widgets
 def section(text: str) -> QLabel:
-    l = QLabel(text.upper())
+    """A small bold section header (Pages' inspector style, sentence case)."""
+    l = QLabel(text)
     l.setObjectName("section")
     return l
 
@@ -41,31 +44,80 @@ def slider(lo: int, hi: int, val: int) -> QSlider:
     return s
 
 
-def toggle_row(labels: list[str], checked: int = 0) -> tuple[QHBoxLayout, QButtonGroup]:
+def toggle_row(labels: list[str], checked: int = 0, small: bool = True) -> tuple[QHBoxLayout, QButtonGroup]:
+    """A segmented control (one choice) in a row; callers may add buttons after it."""
     row = QHBoxLayout()
-    row.setSpacing(6)
-    grp = QButtonGroup(row)
-    grp.setExclusive(True)
-    for i, t in enumerate(labels):
-        b = QPushButton(t)
-        b.setCheckable(True)
-        b.setChecked(i == checked)
-        grp.addButton(b, i)
-        row.addWidget(b)
+    row.setSpacing(design.SPACING["s"])
+    seg = controls.Segmented(labels, checked, small=small)
+    row.addWidget(seg)
     row.addStretch(1)
-    return row, grp
+    return row, seg.group
 
 
-def slider_row(grid: QGridLayout, r: int, label: str, s: QSlider, fmt: Callable[[int], str]) -> QLabel:
-    grid.addWidget(QLabel(label), r, 0)
+def value_box(s: QSlider, suffix: str) -> QSpinBox:
+    """A numeric field with stepper kept in sync with a slider (Pages pairs every slider
+    with one)."""
+    box = QSpinBox()
+    box.setRange(s.minimum(), s.maximum())
+    box.setSuffix(suffix)
+    box.setValue(s.value())
+    box.setFixedWidth(68)
+    box.setAlignment(Qt.AlignRight)
+    box.setAccessibleName(s.accessibleName())
+    box.valueChanged.connect(s.setValue)
+    s.valueChanged.connect(box.setValue)
+    return box
+
+
+def slider_row(grid: QGridLayout, r: int, label: str, s: QSlider, fmt: Callable[[int], str],
+               suffix: str | None = None):
+    """Label, slider and its value: a stepper field when `suffix` is given, else a label."""
+    grid.addWidget(controls.form_label(label), r, 0)
+    s.setAccessibleName(label)
     grid.addWidget(s, r, 1)
-    val = QLabel(fmt(s.value()))
-    val.setObjectName("dim")
-    val.setMinimumWidth(56)
-    val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-    s.valueChanged.connect(lambda v: val.setText(fmt(v)))
+    if suffix is not None:
+        val = value_box(s, suffix)
+    else:
+        val = QLabel(fmt(s.value()))
+        val.setObjectName("dim")
+        val.setMinimumWidth(48)
+        val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        s.valueChanged.connect(lambda v: val.setText(fmt(v)))
     grid.addWidget(val, r, 2)
     return val
+
+
+def percent_row(grid: QGridLayout, r: int) -> QSlider:
+    """The "Size of original" slider every compress-by-percentage window shares."""
+    s = slider(*PERCENT_RANGE, PERCENT_DEFAULT)
+    s.setSingleStep(5)
+    s.setPageStep(10)
+    slider_row(grid, r, "Size of original", s, lambda v: f"{v}%", "%")
+    return s
+
+
+def form_grid() -> QGridLayout:
+    g = QGridLayout()
+    g.setHorizontalSpacing(design.SPACING["s"])
+    g.setVerticalSpacing(design.SPACING["s"])
+    g.setColumnStretch(1, 1)
+    return g
+
+
+def size_fields(w: QSpinBox, h: QSpinBox, unit: str = "px") -> QGridLayout:
+    """Width / Height steppers side by side with small captions under them (Pages' Arrange)."""
+    g = QGridLayout()
+    g.setHorizontalSpacing(design.SPACING["s"])
+    g.setVerticalSpacing(design.SPACING["xxs"])
+    for col, (box, cap) in enumerate(((w, "Width"), (h, "Height"))):
+        box.setSuffix(f" {unit}")
+        box.setAccessibleName(cap)
+        g.addWidget(box, 0, col)
+        c = QLabel(cap)
+        c.setObjectName("dim")
+        c.setAlignment(Qt.AlignHCenter)
+        g.addWidget(c, 1, col)
+    return g
 
 
 def dims_text(w: int, h: int) -> str:
@@ -73,25 +125,52 @@ def dims_text(w: int, h: int) -> str:
 
 
 class ToolWindow(GlassWindow):
+    """A tool: optional canvas on the left, Pages-style inspector on the right (full width
+    when there's no canvas), Cancel / primary at the bottom of the inspector, and actions
+    in a unified toolbar. `self.body` is the inspector's first page, so code written for a
+    plain column still works."""
     tool_name = ""
 
-    def __init__(self, title: str, paths, notify: Notify, size=(820, 680)):
-        super().__init__(title, size=size)
+    def __init__(self, title: str, paths, notify: Notify, size=(820, 680), toolbar: bool = False,
+                 tabs: list[str] | None = None):
         self.paths = [Path(p) for p in (paths if isinstance(paths, (list, tuple)) else [paths])]
         self.path = self.paths[0]
-        self.notify = notify
-        self.submit = None   # set by the app: run work in the background with a spinner
         if len(self.paths) == 1:
             sub = f"{self.path.name}  ·  {human_size(file_size(self.path))}"
         else:
             total = sum(file_size(p) for p in self.paths)
             sub = f"{len(self.paths)} files  ·  {human_size(total)}"
-        self.subtitle = QLabel(sub)
-        self.subtitle.setObjectName("dim")
-        self.body.addWidget(self.subtitle)
+        super().__init__(title, size=size, toolbar=toolbar, subtitle=sub)
+        self.notify = notify
+        self.submit = None   # set by the app: run work in the background with a spinner
+        self.subtitle = QLabel(sub)   # kept for callers; the visible subtitle is in the title bar
+        self.subtitle.hide()
+        self.content.removeItem(self.body)
+        self.split = QHBoxLayout()
+        self.split.setContentsMargins(0, 0, 0, 0)
+        self.split.setSpacing(0)
+        self.content.addLayout(self.split, 1)
+        self.inspector = controls.Inspector(tabs)
+        self.split.addWidget(self.inspector, 1)
+        self.body = self.inspector.content(0)
+        self.canvas: QWidget | None = None
         QShortcut(QKeySequence(Qt.Key_Return), self, activated=self._enter)
         QShortcut(QKeySequence(Qt.Key_Enter), self, activated=self._enter)
         self.primary_btn: QPushButton | None = None
+
+    def set_canvas(self, w: QWidget):
+        """Put the document canvas left of the inspector, which becomes a fixed-width panel."""
+        self.canvas = w
+        if hasattr(w, "corner_radius") and self.native:
+            w.corner_radius = design.RADIUS["window"]
+        self.split.insertWidget(0, w, 1)
+        self.split.insertWidget(1, controls.Hairline(vertical=True))
+        self.split.setStretchFactor(self.inspector, 0)
+        self.inspector.make_panel()
+
+    def set_subtitle(self, text: str):
+        self.subtitle.setText(text)
+        super().set_subtitle(text)
 
     def _enter(self):
         from PySide6.QtWidgets import QApplication
@@ -104,6 +183,7 @@ class ToolWindow(GlassWindow):
 
     def footer(self, primary_text: str, on_primary, on_reset=None, extra_buttons=()) -> QHBoxLayout:
         row = QHBoxLayout()
+        row.setSpacing(design.SPACING["s"])
         if on_reset:
             reset = QPushButton("Reset")
             reset.clicked.connect(on_reset)
@@ -116,10 +196,16 @@ class ToolWindow(GlassWindow):
         row.addWidget(cancel)
         ok = QPushButton(primary_text)
         ok.setObjectName("primary")
+        ok.setDefault(True)          # macOS draws the default button in the accent colour
         ok.clicked.connect(on_primary)
         row.addWidget(ok)
         self.primary_btn = ok
         return row
+
+    def finish(self, primary_text: str, on_primary, on_reset=None, extra_buttons=()):
+        """Close the inspector's groups and add the Cancel / primary footer under them."""
+        self.inspector.finish()
+        self.inspector.set_footer(self.footer(primary_text, on_primary, on_reset, extra_buttons))
 
     def run(self, fn: Callable[[], list], working: str, extra: str = ""):
         """Save in the background (window closes now) or, without the app, synchronously."""
@@ -140,6 +226,7 @@ class CropView(ImageView):
     def __init__(self, image: QImage, k: float):
         super().__init__(image)
         self.k = k
+        self.even = False   # video: H.264 needs even dimensions
         self.ratio: float | None = None
         self.sel = QRectF(0, 0, image.width(), image.height())
         self._mode: str | None = None
@@ -156,6 +243,11 @@ class CropView(ImageView):
             self.sel = QRectF((W - w) / 2, (H - h) / 2, w, h)
         self.update()
         self.changed.emit()
+
+    def out_size(self) -> tuple[int, int]:
+        """The selection's size in full-size pixels (rounded down to even numbers when `even`)."""
+        w, h = round(self.sel.width() * self.k), round(self.sel.height() * self.k)
+        return (w - w % 2, h - h % 2) if self.even else (w, h)
 
     def reset_sel(self):
         self.sel = QRectF(0, 0, self.image.width(), self.image.height())
@@ -244,7 +336,7 @@ class CropView(ImageView):
         hole = QPainterPath()
         hole.addRect(r)
         p.fillPath(shade.subtracted(hole), QColor(0, 0, 0, 140))
-        p.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
+        p.setPen(QPen(QColor(255, 255, 255, 230), 1))
         p.drawRect(r)
         p.setPen(QPen(QColor(255, 255, 255, 70), 1))
         for i in (1, 2):  # rule of thirds
@@ -252,78 +344,87 @@ class CropView(ImageView):
             y = r.top() + r.height() * i / 3
             p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
             p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#ff6a4d"))
-        for pt in (r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()):
-            p.drawEllipse(pt, 5.5, 5.5)
-        # live output size badge
-        txt = dims_text(round(self.sel.width() * self.k), round(self.sel.height() * self.k))
-        f = QFont("Segoe UI", 1)
-        f.setPixelSize(12)
-        f.setBold(True)
-        p.setFont(f)
+        # Photos-style corner brackets
+        arm = min(18.0, r.width() / 3, r.height() / 3)
+        p.setPen(QPen(QColor(255, 255, 255), 3.5, Qt.SolidLine, Qt.SquareCap, Qt.MiterJoin))
+        for pt, sx, sy in ((r.topLeft(), 1, 1), (r.topRight(), -1, 1), (r.bottomLeft(), 1, -1),
+                           (r.bottomRight(), -1, -1)):
+            p.drawPolyline(QPolygonF([QPointF(pt.x(), pt.y() + sy * arm), pt, QPointF(pt.x() + sx * arm, pt.y())]))
+        # live output size badge (a dark HUD capsule, as in Photos)
+        txt = dims_text(*self.out_size())
+        p.setFont(design.font("callout", 500))
         w = p.fontMetrics().horizontalAdvance(txt) + 18
         badge = QRectF(r.center().x() - w / 2, r.bottom() - 30, w, 22)
         if badge.top() < r.top() + 4:
             badge.moveTop(r.bottom() + 6)
-        p.setBrush(QColor(20, 16, 32, 190))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 150))
         p.drawRoundedRect(badge, 11, 11)
         p.setPen(QColor(255, 255, 255))
         p.drawText(badge, Qt.AlignCenter, txt)
 
 
-class CropWindow(ToolWindow):
-    tool_name = "Crop"
+def crop_box(sel: QRectF, k: float, full: tuple[int, int], ratio: float | None) -> tuple[int, int, int, int]:
+    """A preview selection as (x, y, width, height) in full-size pixels. Edges within 3 px of
+    the image's edges snap to them (preview rounding), and a fixed ratio stays exact (no
+    1600×1599)."""
+    fw, fh = full
+    x0, y0 = round(sel.left() * k), round(sel.top() * k)
+    w, h = round(sel.width() * k), round(sel.height() * k)
+    if x0 <= 3:
+        w, x0 = w + x0, 0
+    if y0 <= 3:
+        h, y0 = h + y0, 0
+    snap_w = abs(x0 + w - fw) <= 3
+    snap_h = abs(y0 + h - fh) <= 3
+    if snap_w:
+        w = fw - x0
+    if snap_h:
+        h = fh - y0
+    if ratio:
+        if snap_h and not snap_w:
+            w = round(h * ratio)
+        else:
+            h = round(w / ratio)
+        if y0 + h > fh:
+            h = fh - y0
+            w = round(h * ratio)
+        if x0 + w > fw:
+            w = fw - x0
+            h = round(w / ratio)
+    return x0, y0, w, h
+
+
+class CropInspector:
+    """The aspect-ratio pop-up and Width / Height steppers shared by the image and video Crop
+    windows. Needs `self.view` (a CropView) and `self.inspector`."""
     RATIOS = [("Free", None), ("Original", "orig"), ("1:1", 1.0), ("4:3", 4 / 3), ("3:2", 1.5),
               ("16:9", 16 / 9), ("9:16", 9 / 16), ("4:5", 0.8)]
 
-    def __init__(self, path, notify):
-        super().__init__("Crop Image", path, notify)
-        pv = open_preview(path, 1400)
-        with Image.open(path) as im:
-            fw, fh = im.size
-        from PIL import ImageOps
-        with Image.open(path) as im:
-            o = im.getexif().get(0x0112, 1)
-        if o in (5, 6, 7, 8):
-            fw, fh = fh, fw
-        self.full_size = (fw, fh)
-        self.rot = 0
-        self.base = pv
-        self.view = CropView(qimage_from_pil(pv), fw / pv.width)
-        self.body.addWidget(self.view, 1)
+    def crop_inspector(self, step: int = 1, tip: str = "Double-click the image to reset"):
+        g = self.inspector.group("Aspect Ratio")
+        self.ratio_box = QComboBox()
+        self.ratio_box.setAccessibleName("Aspect ratio")
+        for n, _ in self.RATIOS:
+            self.ratio_box.addItem(n)
+        self.ratio_box.currentIndexChanged.connect(self._ratio)
+        g.addWidget(self.ratio_box)
 
-        self.body.addWidget(section("Aspect ratio"))
-        row, self.grp = toggle_row([n for n, _ in self.RATIOS])
-        self.grp.idClicked.connect(self._ratio)
-        for txt, d in (("⟲", -90), ("⟳", 90)):
-            b = QPushButton(txt)
-            b.setToolTip("Rotate 90°")
-            b.clicked.connect(lambda _=False, d=d: self._rotate(d))
-            row.addWidget(b)
-        self.body.addLayout(row)
-
-        dims = QHBoxLayout()
+        g = self.inspector.group("Size")
         self.w = QSpinBox()
         self.h = QSpinBox()
         for s in (self.w, self.h):
-            s.setRange(1, 100000)
-            s.setFixedWidth(96)
-        dims.addWidget(QLabel("W"))
-        dims.addWidget(self.w)
-        dims.addWidget(QLabel("H"))
-        dims.addWidget(self.h)
-        dims.addWidget(QLabel("px"))
-        dims.addStretch(1)
-        tip = QLabel("Double-click the image to reset")
-        tip.setObjectName("dim")
-        dims.addWidget(tip)
-        self.body.addLayout(dims)
+            s.setRange(step, 100000)
+            s.setSingleStep(step)
+        g.addLayout(size_fields(self.w, self.h))
+        hint = QLabel(tip)
+        hint.setObjectName("dim")
+        hint.setWordWrap(True)
+        g.addWidget(hint)
         self.w.editingFinished.connect(self._from_spin)
         self.h.editingFinished.connect(self._from_spin)
         self.view.changed.connect(self._to_spin)
         self._to_spin()
-        self.body.addLayout(self.footer("Apply", self.apply, self.reset))
 
     def _ratio(self, i):
         r = self.RATIOS[i][1]
@@ -331,20 +432,10 @@ class CropWindow(ToolWindow):
             r = self.view.image.width() / self.view.image.height()
         self.view.set_ratio(r)
 
-    def _rotate(self, d):
-        self.rot = (self.rot + d) % 360
-        img = self.base.rotate(-self.rot, expand=True)
-        k = self.view.k
-        self.view.set_image(qimage_from_pil(img))
-        self.view.k = k
-        self.view.reset_sel()
-
     def _to_spin(self):
-        s = self.view.sel
-        k = self.view.k
-        for box, v in ((self.w, s.width()), (self.h, s.height())):
+        for box, v in zip((self.w, self.h), self.view.out_size()):
             box.blockSignals(True)
-            box.setValue(round(v * k))
+            box.setValue(v)
             box.blockSignals(False)
 
     def _from_spin(self):
@@ -356,42 +447,54 @@ class CropWindow(ToolWindow):
         self.view.update()
         self._to_spin()
 
-    def reset(self):
-        self.grp.button(0).setChecked(True)
+    def reset_ratio(self):
+        self.ratio_box.blockSignals(True)
+        self.ratio_box.setCurrentIndex(0)
+        self.ratio_box.blockSignals(False)
         self.view.ratio = None
+
+
+class CropWindow(CropInspector, ToolWindow):
+    tool_name = "Crop"
+
+    def __init__(self, path, notify):
+        super().__init__("Crop Image", path, notify, size=(1000, 680), toolbar=True)
+        pv = open_preview(path, 1400)
+        with Image.open(path) as im:
+            fw, fh = im.size
+            o = im.getexif().get(0x0112, 1)
+        if o in (5, 6, 7, 8):
+            fw, fh = fh, fw
+        self.full_size = (fw, fh)
+        self.rot = 0
+        self.base = pv
+        self.view = CropView(qimage_from_pil(pv), fw / pv.width)
+        self.set_canvas(self.view)
+        self.toolbar.add(("rotate.left", "Rotate Left", "⟲", lambda: self._rotate(-90)),
+                         ("rotate.right", "Rotate Right", "⟳", lambda: self._rotate(90)))
+        self.toolbar.add(("arrow.counterclockwise", "Reset", "↺", self.reset))
+        self.crop_inspector()
+        self.finish("Apply", self.apply)
+
+    def _rotate(self, d):
+        self.rot = (self.rot + d) % 360
+        img = self.base.rotate(-self.rot, expand=True)
+        k = self.view.k
+        self.view.set_image(qimage_from_pil(img))
+        self.view.k = k
+        self.view.reset_sel()
+
+    def reset(self):
+        self.reset_ratio()
         if self.rot:
             self.rot = 0
             self.view.set_image(qimage_from_pil(self.base))
         self.view.reset_sel()
 
     def apply(self):
-        s, k, rot, path = self.view.sel, self.view.k, self.rot, self.path
-        fw, fh = (self.full_size[1], self.full_size[0]) if rot % 180 else self.full_size
-        x0, y0 = round(s.left() * k), round(s.top() * k)
-        w, h = round(s.width() * k), round(s.height() * k)
-        # preview → full-size rounding: snap to the image edges when within 3 px
-        if x0 <= 3:
-            w, x0 = w + x0, 0
-        if y0 <= 3:
-            h, y0 = h + y0, 0
-        snap_w = abs(x0 + w - fw) <= 3
-        snap_h = abs(y0 + h - fh) <= 3
-        if snap_w:
-            w = fw - x0
-        if snap_h:
-            h = fh - y0
-        if self.view.ratio:  # exact ratio (no 1600×1599)
-            r = self.view.ratio
-            if snap_h and not snap_w:
-                w = round(h * r)
-            else:
-                h = round(w / r)
-            if y0 + h > fh:
-                h = fh - y0
-                w = round(h * r)
-            if x0 + w > fw:
-                w = fw - x0
-                h = round(w / r)
+        rot, path = self.rot, self.path
+        full = (self.full_size[1], self.full_size[0]) if rot % 180 else self.full_size
+        x0, y0, w, h = crop_box(self.view.sel, self.view.k, full, self.view.ratio)
         box = (x0, y0, x0 + w, y0 + h)
 
         def work():
@@ -425,94 +528,69 @@ class AddBgWindow(ToolWindow):
     ASPECTS = ["Auto", "1:1", "4:3", "16:9", "9:16", "4:5"]
 
     def __init__(self, path, notify):
-        super().__init__("Add BG", path, notify, size=(880, 780))
+        super().__init__("Add Background", path, notify, size=(1040, 720), toolbar=True)
         self.small = open_preview(path, 760)
         with Image.open(path) as im:
             self.full_w = max(im.size) if im.getexif().get(0x0112, 1) in (5, 6, 7, 8) else im.width
             self.full_size = im.size
         self.colors = PRESETS[0][1]
 
-        self.preview = QLabel()
-        self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumSize(360, 300)
-        self.body.addWidget(self.preview, 1)
-        self.out_label = QLabel()
-        self.out_label.setObjectName("dim")
-        self.out_label.setAlignment(Qt.AlignCenter)
-        self.body.addWidget(self.out_label)
+        self.preview = ImageView(QImage())
+        self.set_canvas(self.preview)
+        self.copy_btn, = self.toolbar.add(("doc.on.clipboard", "Copy", "⧉", self.copy))
+        self.copy_btn.setToolTip("Copy the result to the clipboard")
+        self.toolbar.add(("arrow.counterclockwise", "Reset", "↺", self.reset))
 
-        self.body.addWidget(section("Background"))
-        sw = QGridLayout()
-        sw.setSpacing(6)
-        self.sw_grp = QButtonGroup(self)
-        items = [("g", c) for _, c in PRESETS] + [("s", [c]) for c in SOLIDS]
-        for i, (_, cols) in enumerate(items):
-            b = QPushButton()
-            b.setObjectName("swatch")
-            b.setCheckable(True)
-            b.setStyleSheet(self._swatch_css(cols))
-            b.setChecked(i == 0)
-            b.setToolTip(PRESETS[i][0] if i < len(PRESETS) else cols[0])
-            b.clicked.connect(lambda _=False, c=cols: self._pick(c))
-            self.sw_grp.addButton(b, i)
-            sw.addWidget(b, i // 12, i % 12)
-        custom = QPushButton("＋")
-        custom.setObjectName("swatch")
-        custom.setToolTip("Custom colour")
-        custom.clicked.connect(self._custom)
-        sw.addWidget(custom, len(items) // 12, len(items) % 12)
-        self.body.addLayout(sw)
+        g = self.inspector.group("Fill")
+        grid = form_grid()
+        self.well = controls.ColorWell(PRESETS + [(c, [c]) for c in SOLIDS], self.colors, columns=8)
+        self.well.picked.connect(self._pick)
+        grid.addWidget(controls.form_label("Colour"), 0, 0)
+        grid.addWidget(self.well, 0, 1, 1, 2, Qt.AlignLeft)
+        self.ang = slider(0, 360, 135)
+        slider_row(grid, 1, "Angle", self.ang, lambda v: f"{v}°", "°")
+        g.addLayout(grid)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
+        g = self.inspector.group("Layout")
+        grid = form_grid()
         self.pad = slider(0, 40, 12)
         self.rad = slider(0, 120, 24)
         self.sha = slider(0, 100, 50)
-        self.ang = slider(0, 360, 135)
-        slider_row(grid, 0, "Padding", self.pad, lambda v: f"{v}%")
-        slider_row(grid, 1, "Corners", self.rad, lambda v: f"{v} px")
-        slider_row(grid, 2, "Shadow", self.sha, lambda v: f"{v}%")
-        slider_row(grid, 3, "Angle", self.ang, lambda v: f"{v}°")
-        self.body.addLayout(grid)
+        slider_row(grid, 0, "Padding", self.pad, lambda v: f"{v}%", "%")
+        slider_row(grid, 1, "Corners", self.rad, lambda v: f"{v} px", " px")
+        slider_row(grid, 2, "Shadow", self.sha, lambda v: f"{v}%", "%")
+        g.addLayout(grid)
 
-        self.body.addWidget(section("Size"))
-        row, self.asp = toggle_row(self.ASPECTS)
-        self.body.addLayout(row)
-
-        self.copy_btn = QPushButton("Copy")
-        self.copy_btn.setToolTip("Copy the result to the clipboard")
-        self.copy_btn.clicked.connect(self.copy)
-        self.body.addLayout(self.footer("Save with Background", self.save, self.reset, [self.copy_btn]))
+        g = self.inspector.group("Size")
+        grid = form_grid()
+        self.asp = QComboBox()
+        self.asp.setAccessibleName("Aspect ratio")
+        self.asp.addItems(self.ASPECTS)
+        grid.addWidget(controls.form_label("Aspect"), 0, 0)
+        grid.addWidget(self.asp, 0, 1)
+        g.addLayout(grid)
+        self.out_label = QLabel()
+        self.out_label.setObjectName("dim")
+        g.addWidget(self.out_label)
+        self.finish("Save", self.save)
 
         self._timer = QTimer(self, singleShot=True, interval=16, timeout=self.render)
         for s in (self.pad, self.rad, self.sha, self.ang):
             s.valueChanged.connect(lambda _: self._timer.start())
-        self.asp.idClicked.connect(lambda _: self._timer.start())
+        self.asp.currentIndexChanged.connect(lambda _: self._timer.start())
         self.render()
-
-    @staticmethod
-    def _swatch_css(cols: list[str]) -> str:
-        if len(cols) == 1:
-            return f"background: {cols[0]};"
-        stops = ", ".join(f"stop:{i / (len(cols) - 1):.2f} {c}" for i, c in enumerate(cols))
-        return f"background: qlineargradient(x1:0,y1:0,x2:1,y2:1, {stops});"
 
     def _pick(self, cols):
         self.colors = cols
+        self.well.set_colors(cols)
         self.render()
-
-    def _custom(self):
-        c = QColorDialog.getColor(QColor(self.colors[0]), self, "Background colour")
-        if c.isValid():
-            self.colors = [c.name()]
-            self.render()
 
     def _params(self, scale: float) -> imaging.Background:
         return imaging.Background(colors=self.colors, angle=self.ang.value(),
                                   padding=self.pad.value() / 100,
                                   radius=int(self.rad.value() * scale),
                                   shadow=self.sha.value() / 100,
-                                  aspect=self.ASPECTS[self.asp.checkedId()])
+                                  aspect=self.ASPECTS[self.asp.currentIndex()])
 
     def _full_scale(self) -> float:
         return max(1.0, max(self.full_size) / 1000)
@@ -520,26 +598,14 @@ class AddBgWindow(ToolWindow):
     def render(self):
         k = max(self.small.size) / max(self.full_size)
         out = imaging.add_background(self.small, self._params(k * self._full_scale()))
-        pm = QPixmap.fromImage(qimage_from_pil(out))
-        self.preview.setPixmap(pm.scaled(self.preview.size() - QSize(10, 10), Qt.KeepAspectRatio,
-                                         Qt.SmoothTransformation))
+        self.preview.set_image(qimage_from_pil(out))
         fw = round(out.width / k)
         fh = round(out.height / k)
         self.out_label.setText(f"Output  {dims_text(fw, fh)} px  ·  PNG")
 
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        if hasattr(self, "_timer"):
-            self._timer.start()
-
-    def showEvent(self, e):
-        super().showEvent(e)
-        QTimer.singleShot(0, self.render)
-
     def reset(self):
         self.pad.setValue(12); self.rad.setValue(24); self.sha.setValue(50); self.ang.setValue(135)
-        self.asp.button(0).setChecked(True)
-        self.sw_grp.button(0).setChecked(True)
+        self.asp.setCurrentIndex(0)
         self._pick(PRESETS[0][1])
 
     def _compose_full(self) -> Image.Image:
@@ -547,8 +613,8 @@ class AddBgWindow(ToolWindow):
 
     def copy(self):
         QGuiApplication.clipboard().setImage(qimage_from_pil(self._compose_full()))
-        self.copy_btn.setText("Copied ✓")
-        QTimer.singleShot(1400, lambda: self.copy_btn.setText("Copy"))
+        self.copy_btn.set_label("Copied")
+        QTimer.singleShot(1400, lambda: self.copy_btn.set_label("Copy"))
 
     def save(self):
         params, path = self._params(self._full_scale()), self.path
@@ -601,9 +667,7 @@ def draw_shape(p: QPainter, s: Shape, map_pt, scale: float):
     elif s.kind == "Ellipse" and len(pts) == 2:
         p.drawEllipse(QRectF(pts[0], pts[1]).normalized())
     elif s.kind == "Text" and pts:
-        f = QFont("Segoe UI", 1)
-        f.setPixelSize(max(8, int(s.width * 5 * scale)))
-        f.setBold(True)
+        f = design.font("body", 700, max(8, int(s.width * 5 * scale)))
         p.setFont(f)
         # outline for legibility on any background
         outline = QPainterPath()
@@ -618,10 +682,7 @@ def draw_shape(p: QPainter, s: Shape, map_pt, scale: float):
         p.setPen(QPen(QColor(255, 255, 255), max(1.5, r * 0.12)))
         p.setBrush(col)
         p.drawEllipse(c, r, r)
-        f = QFont("Segoe UI", 1)
-        f.setPixelSize(int(r * 1.15))
-        f.setBold(True)
-        p.setFont(f)
+        p.setFont(design.font("body", 700, int(r * 1.15)))
         lum = col.red() * 0.3 + col.green() * 0.59 + col.blue() * 0.11
         p.setPen(QColor(20, 20, 20) if lum > 170 else QColor(255, 255, 255))
         p.drawText(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r), Qt.AlignCenter, s.text)
@@ -707,47 +768,41 @@ class AnnotateWindow(ToolWindow):
     COLORS = ["#ff3b30", "#ff9500", "#ffcc00", "#34c759", "#007aff", "#af52de", "#ffffff", "#000000"]
 
     def __init__(self, path, notify):
-        super().__init__("Annotate", path, notify, size=(900, 720))
+        super().__init__("Annotate", path, notify, size=(1100, 740), toolbar=True)
         pv = open_preview(path, 1600)
         with Image.open(path) as im:
             full = im.size if im.getexif().get(0x0112, 1) not in (5, 6, 7, 8) else im.size[::-1]
         self.k = full[0] / pv.width
         self.tool, self.color = "Arrow", self.COLORS[0]
         self.view = AnnotateView(qimage_from_pil(pv), self)
-        self.body.addWidget(self.view, 1)
+        self.set_canvas(self.view)
 
-        row, grp = toggle_row(["➜ Arrow", "▢ Box", "◯ Circle", "✎ Pen", "▬ Marker", "T Text", "① Step"])
+        specs = [("arrow.up.right", "Arrow", "➜"), ("rectangle", "Box", "▢"), ("circle", "Circle", "◯"),
+                 ("pencil.tip", "Pen", "✎"), ("highlighter", "Marker", "▬"), ("textformat", "Text", "T"),
+                 ("1.circle", "Step", "①")]
+        grp = QButtonGroup(self)
+        grp.setExclusive(True)
+        for i, b in enumerate(self.toolbar.add(*specs, checkable=True)):
+            b.setChecked(i == 0)
+            grp.addButton(b, i)
         grp.idClicked.connect(lambda i: setattr(self, "tool", self.TOOLS[i]))
-        undo = QPushButton("Undo")
-        undo.clicked.connect(self.undo)
-        redo = QPushButton("Redo")
-        redo.clicked.connect(self.redo)
+        self.toolbar.add(("arrow.uturn.backward", "Undo", "↶", self.undo),
+                         ("arrow.uturn.forward", "Redo", "↷", self.redo))
         QShortcut(QKeySequence.Undo, self, activated=self.undo)
         QShortcut(QKeySequence.Redo, self, activated=self.redo)
         QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo)
-        row.addWidget(undo)
-        row.addWidget(redo)
-        self.body.addLayout(row)
 
-        crow = QHBoxLayout()
-        cgrp = QButtonGroup(self)
-        for i, c in enumerate(self.COLORS):
-            b = QPushButton()
-            b.setObjectName("swatch")
-            b.setCheckable(True)
-            b.setChecked(i == 0)
-            b.setStyleSheet(f"background: {c};")
-            b.clicked.connect(lambda _=False, c=c: setattr(self, "color", c))
-            cgrp.addButton(b)
-            crow.addWidget(b)
-        crow.addSpacing(16)
-        crow.addWidget(QLabel("Size"))
+        g = self.inspector.group("Style")
+        grid = form_grid()
+        names = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "White", "Black"]
+        self.well = controls.ColorWell([(n, [c]) for n, c in zip(names, self.COLORS)], [self.color], columns=8)
+        self.well.picked.connect(lambda cols: setattr(self, "color", cols[0]))
+        grid.addWidget(controls.form_label("Colour"), 0, 0)
+        grid.addWidget(self.well, 0, 1, 1, 2, Qt.AlignLeft)
         self.stroke = slider(1, 20, 4)
-        self.stroke.setFixedWidth(160)
-        crow.addWidget(self.stroke)
-        crow.addStretch(1)
-        self.body.addLayout(crow)
-        self.body.addLayout(self.footer("Save", self.save))
+        slider_row(grid, 1, "Size", self.stroke, str, " pt")
+        g.addLayout(grid)
+        self.finish("Save", self.save)
 
     def undo(self):
         if self.view.shapes:
@@ -814,7 +869,7 @@ class RedactView(ImageView):
 
     def paint_overlay(self, p, t):
         if self.cur is not None:
-            p.setPen(QPen(QColor("#ff5f6d"), 1.5, Qt.DashLine))
+            p.setPen(QPen(design.color("red"), 1.5, Qt.DashLine))
             p.setBrush(QColor(0, 0, 0, 90))
             p.drawRect(self.rect_to_widget(self.cur))
 
@@ -824,24 +879,26 @@ class RedactWindow(ToolWindow):
     MODES = ["Black box", "Pixelate", "Blur"]
 
     def __init__(self, path, notify):
-        super().__init__("Redact", path, notify)
+        super().__init__("Redact", path, notify, size=(1000, 680), toolbar=True)
         self.base = open_preview(path, 1400)
         with Image.open(path) as im:
             full = im.size if im.getexif().get(0x0112, 1) not in (5, 6, 7, 8) else im.size[::-1]
         self.k = full[0] / self.base.width
         self.view = RedactView(qimage_from_pil(self.base), self)
-        self.body.addWidget(self.view, 1)
-        self.hint = QLabel("Drag over anything you want hidden. It's burned into the pixels — it can't be undone in the copy.")
-        self.hint.setObjectName("dim")
-        self.body.addWidget(self.hint)
+        self.set_canvas(self.view)
+        self.toolbar.add(("arrow.uturn.backward", "Undo", "↶", self.undo))
+        QShortcut(QKeySequence.Undo, self, activated=self.undo)
+
+        g = self.inspector.group("Style")
         row, self.mode = toggle_row(self.MODES)
         self.mode.idClicked.connect(lambda _: self.refresh())
-        undo = QPushButton("Undo")
-        undo.clicked.connect(self.undo)
-        QShortcut(QKeySequence.Undo, self, activated=self.undo)
-        row.addWidget(undo)
-        self.body.addLayout(row)
-        self.body.addLayout(self.footer("Save", self.save))
+        g.addLayout(row)
+        self.hint = QLabel("Drag over anything you want hidden. It's burned into the pixels, so it can't be "
+                           "undone in the copy.")
+        self.hint.setObjectName("dim")
+        self.hint.setWordWrap(True)
+        g.addWidget(self.hint)
+        self.finish("Save", self.save)
 
     def _mode(self):
         return ["black", "pixelate", "blur"][self.mode.checkedId()]
@@ -853,7 +910,7 @@ class RedactWindow(ToolWindow):
         im = imaging.redact(self.base, self._boxes(1.0), self._mode())
         self.view.set_image(qimage_from_pil(im))
         n = len(self.view.rects)
-        self.subtitle.setText(f"{self.path.name}  ·  {n} area{'s' if n != 1 else ''} hidden" if n else self.path.name)
+        self.set_subtitle(f"{self.path.name}  ·  {plural(n, 'area')} hidden" if n else self.path.name)
 
     def undo(self):
         if self.view.rects:
@@ -869,7 +926,7 @@ class RedactWindow(ToolWindow):
 
         def work():
             return [imaging.save_like(imaging.redact(open_image(path), boxes, mode), path, "Redacted")]
-        self.run(work, "Redacting…", f"{len(boxes)} area{'s' if len(boxes) != 1 else ''} {label}")
+        self.run(work, "Redacting…", f"{plural(len(boxes), 'area')} {label}")
 
 
 # ================================================================ EDIT
@@ -877,57 +934,54 @@ class EditWindow(ToolWindow):
     tool_name = "Edit"
 
     def __init__(self, path, notify):
-        super().__init__("Edit", path, notify, size=(880, 780))
+        super().__init__("Edit", path, notify, size=(1040, 720), toolbar=True)
         self.small = open_preview(path, 900)
         with Image.open(path) as im:
             self.full_size = im.size if im.getexif().get(0x0112, 1) not in (5, 6, 7, 8) else im.size[::-1]
         self.adj = imaging.Adjust()
         self.comparing = False
 
-        self.preview = QLabel()
-        self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumSize(360, 300)
-        self.body.addWidget(self.preview, 1)
+        self.preview = ImageView(QImage())
+        self.set_canvas(self.preview)
+        auto, = self.toolbar.add(("wand.and.stars", "Auto", "✦", self.auto))
+        auto.setToolTip("Automatic light and colour")
+        self.toolbar.add(("rotate.left", "Rotate Left", "⟲", lambda: self._rot(-90)),
+                         ("rotate.right", "Rotate Right", "⟳", lambda: self._rot(90)),
+                         ("arrow.left.and.right.righttriangle.left.righttriangle.right", "Flip", "⇋",
+                          lambda: self._flip("h")),
+                         ("arrow.up.and.down.righttriangle.up.righttriangle.down", "Flip Vertical", "⇵",
+                          lambda: self._flip("v")))
+        # a toggle, not hold-to-compare: native toolbar items only report clicks
+        self.cmp_btn, = self.toolbar.add(("square.split.2x1", "Compare", "◐"), checkable=True)
+        self.cmp_btn.setToolTip("Show the original")
+        self.cmp_btn.toggled.connect(self._compare)
+        self.toolbar.add(("arrow.counterclockwise", "Reset", "↺", self.reset))
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
+        g = self.inspector.group("Light and Colour")
+        grid = form_grid()
         self.sl = {
             "brightness": slider(-100, 100, 0), "contrast": slider(-100, 100, 0),
             "saturation": slider(-100, 100, 0), "warmth": slider(-100, 100, 0),
             "sharpness": slider(-100, 100, 0),
         }
         for i, (k, s) in enumerate(self.sl.items()):
-            slider_row(grid, i, k.capitalize(), s, lambda v: f"{v:+d}")
+            slider_row(grid, i, k.capitalize(), s, lambda v: f"{v:+d}", "")
             s.valueChanged.connect(lambda _: self._timer.start())
+        g.addLayout(grid)
+        self.gray = QCheckBox("Black && White")
+        self.gray.toggled.connect(lambda _: self._timer.start())
+        g.addWidget(self.gray)
+
+        g = self.inspector.group("Size")
+        grid = form_grid()
         self.size_sl = slider(5, 100, 100)
-        slider_row(grid, len(self.sl), "Size", self.size_sl, lambda v: f"{v}%")
+        slider_row(grid, 0, "Scale", self.size_sl, lambda v: f"{v}%", "%")
         self.size_sl.valueChanged.connect(self._size_label)
         self.dim_label = QLabel()
         self.dim_label.setObjectName("dim")
-        grid.addWidget(self.dim_label, len(self.sl) + 1, 1)
-        self.body.addLayout(grid)
-
-        row = QHBoxLayout()
-        auto = QPushButton("✦ Auto")
-        auto.setToolTip("Automatic light and colour")
-        auto.clicked.connect(self.auto)
-        row.addWidget(auto)
-        for text, fn in (("⟲", lambda: self._rot(-90)), ("⟳", lambda: self._rot(90)),
-                         ("⇋ Flip", lambda: self._flip("h")), ("⇵ Flip", lambda: self._flip("v"))):
-            b = QPushButton(text)
-            b.clicked.connect(fn)
-            row.addWidget(b)
-        self.gray = QPushButton("B&&W")
-        self.gray.setCheckable(True)
-        self.gray.toggled.connect(lambda _: self._timer.start())
-        row.addWidget(self.gray)
-        row.addStretch(1)
-        cmp_btn = QPushButton("Hold to compare")
-        cmp_btn.pressed.connect(lambda: self._compare(True))
-        cmp_btn.released.connect(lambda: self._compare(False))
-        row.addWidget(cmp_btn)
-        self.body.addLayout(row)
-        self.body.addLayout(self.footer("Save", self.save, self.reset))
+        grid.addWidget(self.dim_label, 1, 1, 1, 2)
+        g.addLayout(grid)
+        self.finish("Save", self.save)
 
         self._timer = QTimer(self, singleShot=True, interval=16, timeout=self.render)
         self._size_label()
@@ -975,24 +1029,14 @@ class EditWindow(ToolWindow):
 
     def render(self):
         out = self.small if self.comparing else imaging.apply_adjust(self.small, self._collect(False))
-        pm = QPixmap.fromImage(qimage_from_pil(out))
-        self.preview.setPixmap(pm.scaled(self.preview.size() - QSize(10, 10), Qt.KeepAspectRatio,
-                                         Qt.SmoothTransformation))
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        if hasattr(self, "_timer"):
-            self._timer.start()
-
-    def showEvent(self, e):
-        super().showEvent(e)
-        QTimer.singleShot(0, self.render)
+        self.preview.set_image(qimage_from_pil(out))
 
     def reset(self):
         for s in self.sl.values():
             s.setValue(0)
         self.size_sl.setValue(100)
         self.gray.setChecked(False)
+        self.cmp_btn.setChecked(False)
         self.adj = imaging.Adjust()
         self._size_label()
         self.render()
@@ -1021,71 +1065,76 @@ class MetadataWindow(ToolWindow):
     tool_name = "Metadata"
 
     def __init__(self, path, notify, is_pdf: bool = False):
-        super().__init__("Metadata", path, notify, size=(640, 380))
+        super().__init__("Metadata", path, notify, size=(640, 330))
         self.is_pdf = is_pdf
         info = imaging.read_pdf_metadata(path) if is_pdf else imaging.read_image_metadata(path)
         summary = {} if is_pdf else imaging.metadata_summary(path)
         self.n_fields, self.has_gps = (len(info), False) if is_pdf else imaging.count_metadata(path)
 
-        card = QFrame()
-        card.setObjectName("card")
-        cl = QGridLayout(card)
-        cl.setContentsMargins(14, 12, 14, 12)
-        cl.setHorizontalSpacing(16)
+        g = self.inspector.group("Summary", collapsible=False)
+        cl = form_grid()
+        cl.setHorizontalSpacing(design.SPACING["m"])
         rows = summary or {k: v for k, v in info.items() if k in ("title", "author", "creator", "producer", "Pages")}
         if not rows:
             rows = {"": "No personal metadata found."}
         for i, (k, v) in enumerate(rows.items()):
             kl = QLabel(k)
             kl.setObjectName("dim")
+            kl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             cl.addWidget(kl, i, 0)
             vl = QLabel(v)
             vl.setTextInteractionFlags(Qt.TextSelectableByMouse)
             cl.addWidget(vl, i, 1)
             if k == "Location":
                 vl.setObjectName("warn")
-                mb = QPushButton("Open map")
+                mb = QPushButton("Open Map")
                 lat, lon = v.split(", ")
                 mb.clicked.connect(lambda _=False, a=lat, b=lon: QDesktopServices.openUrl(
                     QUrl(f"https://www.openstreetmap.org/?mlat={a}&mlon={b}#map=15/{a}/{b}")))
                 cl.addWidget(mb, i, 2)
-        self.body.addWidget(card)
+        cl.setColumnStretch(0, 0)
+        cl.setColumnStretch(1, 1)
+        g.addLayout(cl)
         if self.has_gps:
-            warn = QLabel("⚠  This photo reveals where it was taken.")
+            row = QHBoxLayout()
+            row.setSpacing(design.SPACING["xs"])
+            icon = QLabel()
+            pm = design.symbol("exclamationmark.triangle.fill", 12, design.color("orange"), fallback="⚠")
+            if pm is not None:
+                icon.setPixmap(pm)
+            row.addWidget(icon)
+            warn = QLabel("This photo reveals where it was taken.")
             warn.setObjectName("warn")
-            self.body.addWidget(warn)
+            row.addWidget(warn, 1)
+            g.addLayout(row)
 
-        self.toggle = QPushButton(f"Show all {self.n_fields} fields")
-        self.toggle.setCheckable(True)
-        self.body.addWidget(self.toggle, 0, Qt.AlignLeft)
+        g = self.inspector.group(f"All Fields ({self.n_fields})", expanded=False)
+        self.toggle = self.inspector.headers[-1]
         t = QTableWidget(len(info), 2)
         t.setHorizontalHeaderLabels(["Field", "Value"])
         t.verticalHeader().setVisible(False)
         t.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         t.horizontalHeader().setStretchLastSection(True)
         t.setEditTriggers(QTableWidget.NoEditTriggers)
+        t.setAlternatingRowColors(True)
+        t.setShowGrid(False)
+        t.setMinimumHeight(220)
         for r, (k, v) in enumerate(info.items()):
             t.setItem(r, 0, QTableWidgetItem(k))
             t.setItem(r, 1, QTableWidgetItem(v))
-        t.setVisible(False)
-
-        def show_all(on):
-            t.setVisible(on)
-            self.resize(self.width(), 640 if on else 380)
-        self.toggle.toggled.connect(show_all)
-        self.body.addWidget(t, 1)
-        self.body.addStretch(0)
+        g.addWidget(t)
+        self.toggle.toggled.connect(lambda on: self.resize(self.width(), 640 if on else 330))
 
         extra = []
         if self.has_gps:
-            loc = QPushButton("Remove location only")
+            loc = QPushButton("Remove Location Only")
             loc.clicked.connect(self.strip_location)
             extra.append(loc)
-        self.body.addLayout(self.footer("Remove all metadata", self.strip, None, extra))
+        self.finish("Remove All Metadata", self.strip, None, extra)
 
     def strip(self):
         path, is_pdf = self.path, self.is_pdf
-        detail = f"removed {self.n_fields} field{'s' if self.n_fields != 1 else ''}" + (" incl. GPS location" if self.has_gps else "")
+        detail = f"removed {plural(self.n_fields, 'field')}" + (" incl. GPS location" if self.has_gps else "")
 
         def work():
             return [imaging.strip_pdf_metadata(path) if is_pdf else imaging.strip_image_metadata(path)]
@@ -1104,79 +1153,89 @@ class CompressWindow(ToolWindow):
     TARGETS = [("2 MB", 2_000_000), ("1 MB", 1_000_000), ("500 KB", 500_000), ("200 KB", 200_000), ("100 KB", 100_000)]
 
     def __init__(self, paths, notify):
-        super().__init__("Compress", paths, notify, size=(640, 580))
+        super().__init__("Compress", paths, notify, size=(640, 600))
         self.orig_total = sum(file_size(p) for p in self.paths)
         self.pv = open_preview(self.path, 1600)
         with Image.open(self.path) as im:
             self.full_px = im.width * im.height
             self.full_long = max(im.size)
 
-        row, self.mode = toggle_row(["Quality", "Target size"])
-        self.body.addLayout(row)
+        g = self.inspector.group("Compression", collapsible=False)
+        row, self.mode = toggle_row(["Quality", "Target Size", "Percentage"])
+        g.addLayout(row)
 
         self.q_box = QWidget()
-        g = QGridLayout(self.q_box)
-        g.setContentsMargins(0, 0, 0, 0)
+        grid = form_grid()
+        self.q_box.setLayout(grid)
+        grid.setContentsMargins(0, 0, 0, 0)
         self.q = slider(10, 95, 72)
-        slider_row(g, 0, "Quality", self.q, lambda v: f"{v}")
-        self.body.addWidget(self.q_box)
+        slider_row(grid, 0, "Quality", self.q, lambda v: f"{v}", "")
+        g.addWidget(self.q_box)
 
         self.t_box = QWidget()
         tl = QHBoxLayout(self.t_box)
         tl.setContentsMargins(0, 0, 0, 0)
-        tl.addWidget(QLabel("Make each file under"))
-        self.tgrp = QButtonGroup(self)
-        for i, (lbl, _) in enumerate(self.TARGETS):
-            b = QPushButton(lbl)
-            b.setCheckable(True)
-            b.setChecked(i == 2)
-            self.tgrp.addButton(b, i)
-            tl.addWidget(b)
-        tl.addStretch(1)
+        tl.addWidget(controls.form_label("Make each file under"))
+        trow, self.tgrp = toggle_row([lbl for lbl, _ in self.TARGETS], 2)
+        tl.addLayout(trow, 1)
         self.t_box.setVisible(False)
-        self.body.addWidget(self.t_box)
+        g.addWidget(self.t_box)
 
-        g2 = QGridLayout()
-        g2.addWidget(QLabel("Size"), 0, 0)
+        self.p_box = QWidget()
+        pgrid = form_grid()
+        pgrid.setContentsMargins(0, 0, 0, 0)
+        self.p_box.setLayout(pgrid)
+        self.pct = percent_row(pgrid, 0)
+        self.p_box.setVisible(False)
+        g.addWidget(self.p_box)
+
+        g = self.inspector.group("Output", collapsible=False)
+        g2 = form_grid()
+        g2.addWidget(controls.form_label("Size"), 0, 0)
         self.side = QComboBox()
+        self.side.setAccessibleName("Size")
         for name, _ in self.SIDES:
             self.side.addItem(name)
-        g2.addWidget(self.side, 0, 1)
+        g2.addWidget(self.side, 0, 1, Qt.AlignLeft)
         self.webp = QCheckBox("Convert to WebP (usually the smallest)")
         g2.addWidget(self.webp, 1, 1)
-        self.body.addLayout(g2)
+        g.addLayout(g2)
 
-        # before / after at 100%
+        g = self.inspector.group("Preview at 100%", collapsible=False)
         pr = QHBoxLayout()
+        pr.setSpacing(design.SPACING["m"])
         self.before = QLabel()
         self.after = QLabel()
         for lab, cap in ((self.before, "Original"), (self.after, "Compressed")):
             col = QVBoxLayout()
+            col.setSpacing(design.SPACING["xs"])
             lab.setFixedSize(270, 170)
             lab.setAlignment(Qt.AlignCenter)
-            lab.setStyleSheet("border-radius: 12px; background: rgba(0,0,0,0.25);")
+            lab.setObjectName("preview")
+            lab.setAccessibleName(f"{cap} preview")
             c = QLabel(cap)
             c.setObjectName("dim")
             col.addWidget(lab)
             col.addWidget(c, 0, Qt.AlignHCenter)
             pr.addLayout(col)
-        self.body.addLayout(pr)
+        pr.addStretch(1)
+        g.addLayout(pr)
 
         self.est = QLabel()
         self.est.setObjectName("big")
         self.saving = QLabel()
         self.saving.setObjectName("good")
-        self.body.addWidget(self.est)
-        self.body.addWidget(self.saving)
-        self.body.addStretch(1)
-        label = "Compress" if len(self.paths) == 1 else f"Compress {len(self.paths)} files"
-        self.body.addLayout(self.footer(label, self.save))
+        g.addWidget(self.est)
+        g.addWidget(self.saving)
+        label = "Compress" if len(self.paths) == 1 else f"Compress {len(self.paths)} Files"
+        self.finish(label, self.save)
 
         self._timer = QTimer(self, singleShot=True, interval=60, timeout=self.estimate)
         self.q.valueChanged.connect(lambda _: self._timer.start())
         self.side.currentIndexChanged.connect(lambda _: self._timer.start())
         self.webp.toggled.connect(lambda _: self._timer.start())
         self.tgrp.idClicked.connect(lambda _: self._timer.start())
+        self.pct.valueChanged.connect(lambda _: self._timer.start())
         self.mode.idClicked.connect(self._mode)
         self._set_before()
         self.estimate()
@@ -1184,6 +1243,7 @@ class CompressWindow(ToolWindow):
     def _mode(self, i):
         self.q_box.setVisible(i == 0)
         self.t_box.setVisible(i == 1)
+        self.p_box.setVisible(i == 2)
         self._timer.start()
 
     def _detail_box(self, im: Image.Image) -> tuple[int, int, int, int]:
@@ -1222,8 +1282,8 @@ class CompressWindow(ToolWindow):
         # scale factor from preview pixels to output pixels
         out_long = min(self.full_long, side) if side else self.full_long
         px_ratio = (out_long / max(im.size)) ** 2
-        if self.mode.checkedId() == 1:
-            limit = self.TARGETS[self.tgrp.checkedId()][1]
+        if self.mode.checkedId() in (1, 2):
+            limit = self._limit(self.path)
             q = self._quality_for(im, target, limit, px_ratio)
             note = f"quality ≈ {q}"
         else:
@@ -1256,9 +1316,15 @@ class CompressWindow(ToolWindow):
             self.saving.setText(f"≈ {pct:.0f}% smaller · {fmt}" + (f" · {note}" if note else ""))
         else:
             self.saving.setObjectName("warn")
-            self.saving.setText("Already well compressed — try a smaller size or WebP")
+            self.saving.setText("Already well compressed. Try a smaller size or WebP.")
         self.saving.style().unpolish(self.saving)
         self.saving.style().polish(self.saving)
+
+    def _limit(self, path) -> int:
+        """Byte budget for one file: the picked target size, or a share of its own size."""
+        if self.mode.checkedId() == 2:
+            return int(file_size(path) * self.pct.value() / 100)
+        return self.TARGETS[self.tgrp.checkedId()][1]
 
     @staticmethod
     def _quality_for(im, target, limit, px_ratio) -> int:
@@ -1274,9 +1340,12 @@ class CompressWindow(ToolWindow):
     def save(self):
         side, target = self._settings()
         paths = list(self.paths)
-        if self.mode.checkedId() == 1:
-            limit = self.TARGETS[self.tgrp.checkedId()][1]
-            label = self.TARGETS[self.tgrp.checkedId()][0]
+        if self.mode.checkedId() in (1, 2):
+            limits = {p: self._limit(p) for p in paths}
+            if self.mode.checkedId() == 2:
+                label = f"aimed for {self.pct.value()}%"
+            else:
+                label = f"target {self.TARGETS[self.tgrp.checkedId()][0]}"
 
             def work():
                 outs = []
@@ -1284,10 +1353,10 @@ class CompressWindow(ToolWindow):
                     im = open_image(p)
                     if side and max(im.size) > side:
                         im.thumbnail((side, side), Image.LANCZOS)
-                    q, s2 = imaging.plan_target_size(im, target, limit)
+                    q, s2 = imaging.plan_target_size(im, target, limits[p])
                     outs.append(imaging.compress_to(p, q, min(x for x in (side, s2) if x) if (side or s2) else None, target))
                 return outs
-            self.run(work, "Compressing…", f"target {label}")
+            self.run(work, "Compressing…", label)
         else:
             q = self.q.value()
             self.run(lambda: [imaging.compress_to(p, q, side, target) for p in paths], "Compressing…", f"quality {q}")
@@ -1300,18 +1369,22 @@ class ResizeWindow(ToolWindow):
                ("2560", "long", 2560), ("1920", "long", 1920), ("1280", "long", 1280), ("800", "long", 800)]
 
     def __init__(self, paths, notify):
-        super().__init__("Resize", paths, notify, size=(600, 380))
+        super().__init__("Resize", paths, notify, size=(600, 400))
         with Image.open(self.path) as im:
             w, h = im.size
             if im.getexif().get(0x0112, 1) in (5, 6, 7, 8):
                 w, h = h, w
         self.orig = (w, h)
-        self.body.addWidget(section("Presets — percent or longest side in px"))
+        g = self.inspector.group("Presets", collapsible=False)
         row, self.grp = toggle_row([p[0] for p in self.PRESETS], 1)
         self.grp.idClicked.connect(self._preset)
-        self.body.addLayout(row)
-        self.body.addWidget(section("Exact size"))
+        g.addLayout(row)
+        hint = QLabel("Percent, or the longest side in pixels")
+        hint.setObjectName("dim")
+        g.addWidget(hint)
+        g = self.inspector.group("Exact Size", collapsible=False)
         er = QHBoxLayout()
+        er.setSpacing(design.SPACING["m"])
         self.w = QSpinBox()
         self.h = QSpinBox()
         for s in (self.w, self.h):
@@ -1319,21 +1392,15 @@ class ResizeWindow(ToolWindow):
             s.setFixedWidth(100)
         self.lock = QCheckBox("Keep proportions")
         self.lock.setChecked(True)
-        er.addWidget(QLabel("W"))
-        er.addWidget(self.w)
-        er.addWidget(QLabel("H"))
-        er.addWidget(self.h)
-        er.addWidget(QLabel("px"))
-        er.addSpacing(10)
-        er.addWidget(self.lock)
+        er.addLayout(size_fields(self.w, self.h))
+        er.addWidget(self.lock, 0, Qt.AlignTop)
         er.addStretch(1)
-        self.body.addLayout(er)
+        g.addLayout(er)
         self.out = QLabel()
         self.out.setObjectName("big")
-        self.body.addWidget(self.out)
-        self.body.addStretch(1)
-        label = "Resize" if len(self.paths) == 1 else f"Resize {len(self.paths)} files"
-        self.body.addLayout(self.footer(label, self.save))
+        g.addWidget(self.out)
+        label = "Resize" if len(self.paths) == 1 else f"Resize {len(self.paths)} Files"
+        self.finish(label, self.save)
         self.w.valueChanged.connect(lambda v: self._typed("w", v))
         self.h.valueChanged.connect(lambda v: self._typed("h", v))
         self._preset(1)
@@ -1381,27 +1448,28 @@ class ProtectWindow(ToolWindow):
     tool_name = "Protect"
 
     def __init__(self, path, notify):
-        super().__init__("Password-protect PDF", path, notify, size=(520, 330))
-        g = QGridLayout()
+        super().__init__("Password-Protect PDF", path, notify, size=(520, 300))
+        grp = self.inspector.group("Password", collapsible=False)
+        g = form_grid()
         self.pw = QLineEdit()
         self.pw2 = QLineEdit()
-        for e in (self.pw, self.pw2):
+        for e, name in ((self.pw, "Password"), (self.pw2, "Confirm")):
             e.setEchoMode(QLineEdit.Password)
-        g.addWidget(QLabel("Password"), 0, 0)
+            e.setAccessibleName(name)
+        g.addWidget(controls.form_label("Password"), 0, 0)
         g.addWidget(self.pw, 0, 1)
-        g.addWidget(QLabel("Confirm"), 1, 0)
+        g.addWidget(controls.form_label("Confirm"), 1, 0)
         g.addWidget(self.pw2, 1, 1)
         show = QCheckBox("Show")
         show.toggled.connect(lambda on: [e.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
                                          for e in (self.pw, self.pw2)])
         g.addWidget(show, 0, 2)
-        self.body.addLayout(g)
+        grp.addLayout(g)
         self.msg = QLabel("AES-256 encryption. Anyone opening the PDF will need this password.")
         self.msg.setObjectName("dim")
         self.msg.setWordWrap(True)
-        self.body.addWidget(self.msg)
-        self.body.addStretch(1)
-        self.body.addLayout(self.footer("Protect", self.save))
+        grp.addWidget(self.msg)
+        self.finish("Protect", self.save)
         self.pw.textChanged.connect(self._check)
         self.pw2.textChanged.connect(self._check)
         self._check()
