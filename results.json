@@ -1,0 +1,354 @@
+[
+ {
+  "name": "JPG \u2192 PNG",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo.png \u00b7 2400\u00d71600",
+  "seconds": 5.7,
+  "t": 5.7
+ },
+ {
+  "name": "JPG \u2192 WEBP",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo.webp \u00b7 2400\u00d71600",
+  "seconds": 5.4,
+  "t": 11.7
+ },
+ {
+  "name": "JPG \u2192 HEIC",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo.heic \u00b7 2400\u00d71600",
+  "seconds": 6.0,
+  "t": 18.3
+ },
+ {
+  "name": "JPG \u2192 TIFF",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo.tiff \u00b7 2400\u00d71600",
+  "seconds": 6.7,
+  "t": 26.1
+ },
+ {
+  "name": "JPG \u2192 AVIF",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo.avif \u00b7 2400\u00d71600",
+  "seconds": 5.6,
+  "t": 32.3
+ },
+ {
+  "name": "JPG \u2192 BMP",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo.bmp \u00b7 2400\u00d71600",
+  "seconds": 5.1,
+  "t": 38.0
+ },
+ {
+  "name": "JPG \u2192 PDF",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo.pdf \u00b7 1 page(s)",
+  "seconds": 5.0,
+  "t": 43.7
+ },
+ {
+  "name": "JPG \u2192 ICO",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo.ico \u00b7 128\u00d786",
+  "seconds": 5.1,
+  "t": 49.4
+ },
+ {
+  "name": "JPG \u2192 GIF",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo.gif \u00b7 2400\u00d71600",
+  "seconds": 5.4,
+  "t": 55.3
+ },
+ {
+  "name": "PNG \u2192 JPG",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Graphic.jpg \u00b7 800\u00d7533",
+  "seconds": 5.0,
+  "t": 61.0
+ },
+ {
+  "name": "PDF \u2192 JPG (3 pages)",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "3 \u00d7 .jpg",
+  "seconds": 5.1,
+  "t": 66.7
+ },
+ {
+  "name": "PDF \u2192 PNG (3 pages)",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "3 \u00d7 .png",
+  "seconds": 6.5,
+  "t": 73.8
+ },
+ {
+  "name": "PDF \u2192 DOCX",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Report.docx",
+  "seconds": 5.1,
+  "t": 79.5
+ },
+ {
+  "name": "PDF \u2192 TXT",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Report.txt",
+  "seconds": 5.1,
+  "t": 85.1
+ },
+ {
+  "name": "DOCX \u2192 PDF",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Letter.pdf \u00b7 1 page(s)",
+  "seconds": 5.1,
+  "t": 90.8
+ },
+ {
+  "name": "DOCX \u2192 TXT",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Letter.txt",
+  "seconds": 5.1,
+  "t": 96.5
+ },
+ {
+  "name": "TXT \u2192 PDF",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Notes.pdf \u00b7 1 page(s)",
+  "seconds": 5.1,
+  "t": 102.2
+ },
+ {
+  "name": "TXT \u2192 DOCX",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Notes.docx",
+  "seconds": 5.1,
+  "t": 107.9
+ },
+ {
+  "name": "2 images \u2192 1 PDF",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "2 images \u2192 2-page PDF",
+  "seconds": 6.6,
+  "t": 115.1
+ },
+ {
+  "name": "Compress to 200 KB",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "RuntimeError: control not found: 'Target size'",
+  "seconds": 13.0,
+  "t": 128.7
+ },
+ {
+  "name": "Resize 50%",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "2400\u00d71600 \u2192 1200\u00d7800",
+  "seconds": 8.3,
+  "t": 137.6
+ },
+ {
+  "name": "Crop 1:1",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "RuntimeError: control not found: '1:1'",
+  "seconds": 13.0,
+  "t": 151.2
+ },
+ {
+  "name": "Edit: auto + rotate",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "RuntimeError: control not found: '\u2726 Auto'",
+  "seconds": 13.1,
+  "t": 164.9
+ },
+ {
+  "name": "Annotate",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "RuntimeError: control not found: '\u2460 Step'",
+  "seconds": 14.5,
+  "t": 180.0
+ },
+ {
+  "name": "Redact",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "Photo Redacted.jpg \u00b7 centre blacked out",
+  "seconds": 9.7,
+  "t": 190.2
+ },
+ {
+  "name": "Add BG 1:1",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "RuntimeError: window not found: Add BG.*",
+  "seconds": 18.4,
+  "t": 209.3
+ },
+ {
+  "name": "Metadata: remove location",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "RuntimeError: control not found: 'Remove location only'",
+  "seconds": 12.9,
+  "t": 222.8
+ },
+ {
+  "name": "Metadata: remove all",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "RuntimeError: control not found: 'Remove all metadata'",
+  "seconds": 13.0,
+  "t": 236.4
+ },
+ {
+  "name": "PDF Compress",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "AssertionError: no output file appeared",
+  "seconds": 20.9,
+  "t": 257.9
+ },
+ {
+  "name": "PDF Split",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "3 PDFs",
+  "seconds": 5.9,
+  "t": 264.4
+ },
+ {
+  "name": "PDF Rotate",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "all pages at 90\u00b0",
+  "seconds": 6.0,
+  "t": 271.0
+ },
+ {
+  "name": "PDF Protect",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "RuntimeError: window not found: Password-protect.*",
+  "seconds": 18.5,
+  "t": 290.1
+ },
+ {
+  "name": "PDF Extract images",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "1 image(s) in Report images/",
+  "seconds": 6.0,
+  "t": 296.6
+ },
+ {
+  "name": "PDF Metadata",
+  "where": "explorer",
+  "status": "FAIL",
+  "detail": "RuntimeError: control not found: 'Remove all metadata'",
+  "seconds": 13.0,
+  "t": 310.2
+ },
+ {
+  "name": "Merge 2 PDFs",
+  "where": "explorer",
+  "status": "PASS",
+  "detail": "5 pages",
+  "seconds": 7.5,
+  "t": 318.4
+ },
+ {
+  "name": "Send To \u2192 PNG",
+  "where": "send-to",
+  "status": "PASS",
+  "detail": "Photo.png \u00b7 2400\u00d71600",
+  "seconds": 5.3,
+  "t": 324.2
+ },
+ {
+  "name": "Desktop: JPG \u2192 PNG",
+  "where": "desktop",
+  "status": "PASS",
+  "detail": "D-Photo.png \u00b7 2400\u00d71600",
+  "seconds": 5.3,
+  "t": 329.5
+ },
+ {
+  "name": "Desktop: PDF \u2192 TXT",
+  "where": "desktop",
+  "status": "PASS",
+  "detail": "D-Report.txt",
+  "seconds": 4.9,
+  "t": 335.0
+ },
+ {
+  "name": "Desktop: DOCX \u2192 PDF",
+  "where": "desktop",
+  "status": "PASS",
+  "detail": "D-Letter.pdf \u00b7 1 page(s)",
+  "seconds": 5.0,
+  "t": 340.6
+ },
+ {
+  "name": "Desktop: Compress",
+  "where": "desktop",
+  "status": "FAIL",
+  "detail": "RuntimeError: control not found: 'Target size'",
+  "seconds": 13.0,
+  "t": 354.2
+ },
+ {
+  "name": "Desktop: Crop",
+  "where": "desktop",
+  "status": "FAIL",
+  "detail": "RuntimeError: control not found: '1:1'",
+  "seconds": 12.9,
+  "t": 367.7
+ },
+ {
+  "name": "Desktop: Add BG",
+  "where": "desktop",
+  "status": "FAIL",
+  "detail": "RuntimeError: window not found: Add BG.*",
+  "seconds": 18.3,
+  "t": 386.7
+ },
+ {
+  "name": "Desktop: 2 PDFs merge",
+  "where": "desktop",
+  "status": "PASS",
+  "detail": "5 pages",
+  "seconds": 7.3,
+  "t": 394.6
+ },
+ {
+  "name": "Drag picture kept out of the glass",
+  "where": "all",
+  "status": "PASS",
+  "detail": "hidden during 41 menu captures",
+  "seconds": 0,
+  "t": 0
+ }
+]
